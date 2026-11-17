@@ -48,6 +48,11 @@
     el("hk-audio").innerHTML = c.audio_ok
       ? ok("Opus")
       : bad(`${name(c.audio)} — HomeKit audio is off (needs Opus)`);
+    el("hk-motion").innerHTML = c.motion
+      ? ok("Motion detection on")
+      : bad('Motion detection is off — the sensor stays inactive in Home. Turn it on with ' +
+            '<code>[motion] enabled = true</code> in raptor.conf (<code>raptorctl config set motion enabled true</code>, ' +
+            'then <code>raptorctl rvd restart</code>).');
     const fixes = [];
     if (!c.audio_ok) fixes.push("switch audio to <b>Opus</b> (RTSP clients get Opus too)");
     if (!c.video_ok) fixes.push("switch the <b>sub</b> stream to <b>H.264</b> (main is left as it is)");

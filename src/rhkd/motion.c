@@ -44,11 +44,14 @@ static int PollRmd(void) {
     return strncmp(st + 1, "idle", 4) != 0;
 }
 
-// rvd's raw IVS result: true only on the frames where motion was seen.
+// rvd's raw IVS result: true only on the frames where motion was seen. -1: rvd did not answer;
+// -2: motion detection is off (raptor.conf [motion] enabled), so the sensor can never fire.
 static int PollRvd(void) {
     char resp[512];
     if (rss_ctrl_send_command(RVD_SOCK, "{\"cmd\":\"ivs-status\"}", resp, sizeof resp, 500) <= 0)
         return -1;
+    if (strstr(resp, "\"active\":false"))
+        return -2;
     return strstr(resp, "\"motion\":true") != NULL;
 }
 
@@ -83,11 +86,19 @@ static void* Thread(void* arg HAP_UNUSED) {
     for (;;) {
         const char* source = "rvd";
         int m = PollRvd();
-        if (m < 0) {
+        if (m == -2) {
+            // Report the sensor as inactive (StatusActive false) instead of a sensor that never triggers.
+            source = "off";
+            m = -1;
+        } else if (m < 0) {
             source = "rmd";
             m = PollRmd();
         }
         bool avail = m >= 0;
+        if (strcmp(source, "off") == 0 && strcmp(lastSource, "off") != 0) {
+            HAPLogInfo(&logObject, "motion detection is off in raptor.conf ([motion] enabled = true to use the sensor)");
+            lastSource = "off";
+        }
         uint64_t now = NowMs();
         if (avail && strcmp(source, lastSource) != 0) {
             HAPLogInfo(&logObject, "motion source: %s", source);

@@ -60,8 +60,10 @@ codecs() {
 	s=$(video_codec 1)
 	vok=false
 	{ [ "$m" = h264 ] || [ "$s" = h264 ]; } && vok=true
-	printf '{"audio":%s,"main":%s,"sub":%s,"video_ok":%s,"audio_ok":%s}' "$(json_str "$a")" "$(json_str "$m")" \
-		"$(json_str "$s")" "$vok" "$([ "$a" = opus ] && echo true || echo false)"
+	mot=false
+	raptorctl rvd ivs-status 2>/dev/null | grep -q '"active":true' && mot=true
+	printf '{"audio":%s,"main":%s,"sub":%s,"video_ok":%s,"audio_ok":%s,"motion":%s}' "$(json_str "$a")" "$(json_str "$m")" \
+		"$(json_str "$s")" "$vok" "$([ "$a" = opus ] && echo true || echo false)" "$mot"
 }
 
 fixcodecs() {
