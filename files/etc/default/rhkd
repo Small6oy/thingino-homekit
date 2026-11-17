@@ -1,0 +1,32 @@
+# Settings for /etc/init.d/S98rhkd (native HomeKit camera daemon).
+
+# Set to false to keep rhkd from starting at boot.
+RHKD_ENABLED=true
+
+# Name shown in the Home app when adding the camera. Empty = the camera's name (its hostname).
+# Renaming it here does not rename an already-paired camera in Home.
+RHKD_NAME=
+
+# Pairing store (keys and controller pairings). Keep it on flash so pairing survives reboots.
+# The setup code and QR payload are in setup.txt next to it.
+RHKD_STORE=/etc/homekit/store
+
+# Log level: 0 none, 1 default, 2 info, 3 debug.
+RHKD_LOG_LEVEL=2
+
+# Video source: auto (by the bitrate iOS asks for), main or sub.
+RHKD_VIDEO_RING=auto
+
+# Motion sensor debounce (raw IVS motion from rvd; sensitivity is [motion] sensitivity in raptor.conf).
+# Detected after MIN_HITS raw hits within WINDOW_MS; cleared after HOLD_SEC without any.
+RHKD_MOTION_MIN_HITS=2
+RHKD_MOTION_WINDOW_MS=3000
+RHKD_MOTION_HOLD_SEC=10
+
+# Audio RTP clock: empty = the sample rate iOS negotiates (16/24 kHz), or 48000 (RFC 7587).
+RHKD_AUDIO_CLOCK=
+
+# While Home is viewing from the sub stream, its bitrate follows what iOS asks for (never above the configured
+# value, never below RHKD_MIN_BITRATE_KBPS) and is restored afterwards. main is never changed.
+RHKD_ADAPT_BITRATE=true
+RHKD_MIN_BITRATE_KBPS=300

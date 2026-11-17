@@ -1,0 +1,90 @@
+From d6d827a17b4fa64889470cba0820040741a23c40 Mon Sep 17 00:00:00 2001
+From: Small6oy <14087376+Small6oy@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 09:40:14 +1100
+Subject: [PATCH] HAPIPAccessoryServer: serve camera snapshots from POST
+ /resource
+
+The open-source ADK left post_resource as an empty stub. Call a weak
+HAPCameraTakeSnapshot() hook and write the JPEG straight into the
+session's outbound buffer, sized for the encryption overhead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ HAP/HAPIPAccessoryServer.c | 61 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/HAP/HAPIPAccessoryServer.c b/HAP/HAPIPAccessoryServer.c
+index 025cb86..5ff4012 100644
+--- a/HAP/HAPIPAccessoryServer.c
++++ b/HAP/HAPIPAccessoryServer.c
+@@ -564,7 +564,66 @@ static void prepare_reading_request(HAPIPSessionDescriptor* session) {
+ 
+ static void handle_input(HAPIPSessionDescriptor* session);
+ 
+-static void post_resource(HAPIPSessionDescriptor* session HAP_UNUSED) {
++/**
++ * Camera snapshot hook (rhkd). Weak so non-camera apps still link.
++ * Writes a JPEG of roughly @width x @height into @bytes. Returns its size, or 0 on failure.
++ */
++extern size_t HAPCameraTakeSnapshot(uint16_t width, uint16_t height, uint8_t* bytes, size_t maxBytes)
++        __attribute__((weak));
++
++static uint16_t json_uint(const char* body, size_t n, const char* key) {
++    // Tiny scanner for {"image-width":640,...}: finds "key" then the next number.
++    size_t kl = HAPStringGetNumBytes(key);
++    for (size_t i = 0; i + kl + 2 < n; i++) {
++        if (body[i] == '"' && HAPRawBufferAreEqual(&body[i + 1], key, kl) && body[i + 1 + kl] == '"') {
++            unsigned v = 0;
++            size_t j = i + kl + 2;
++            while (j < n && (body[j] < '0' || body[j] > '9'))
++                j++;
++            while (j < n && body[j] >= '0' && body[j] <= '9')
++                v = v * 10 + (unsigned) (body[j++] - '0');
++            return (uint16_t) v;
++        }
++    }
++    return 0;
++}
++
++static void post_resource(HAPIPSessionDescriptor* session) {
++    HAPPrecondition(session);
++    HAPIPByteBuffer* out = &session->outboundBuffer;
++    if (!HAPCameraTakeSnapshot || !session->httpContentLength.isDefined) {
++        write_msg(out, kHAPIPAccessoryServerResponse_ResourceNotFound);
++        return;
++    }
++    const char* body = &session->inboundBuffer.data[session->httpReaderPosition];
++    size_t n = session->httpContentLength.value;
++    uint16_t width = json_uint(body, n, "image-width");
++    uint16_t height = json_uint(body, n, "image-height");
++
++    // Leave room for headers and for the in-place encryption overhead (16+2 bytes per 1024-byte frame).
++    size_t avail = out->limit - out->position;
++    size_t headerReserve = 128;
++    if (avail < headerReserve + 2048) {
++        write_msg(out, kHAPIPAccessoryServerResponse_OutOfResources);
++        return;
++    }
++    size_t maxJpeg = (avail * 1024) / 1042 - headerReserve - 64;
++    uint8_t* jpeg = (uint8_t*) &out->data[out->position + headerReserve];
++    size_t len = HAPCameraTakeSnapshot(width, height, jpeg, maxJpeg);
++    if (!len) {
++        write_msg(out, kHAPIPAccessoryServerResponse_ResourceNotFound);
++        return;
++    }
++    char hdr[128];
++    HAPError err = HAPStringWithFormat(
++            hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: %lu\r\n\r\n",
++            (unsigned long) len);
++    HAPAssert(!err);
++    size_t hl = HAPStringGetNumBytes(hdr);
++    HAPRawBufferCopyBytes(&out->data[out->position], hdr, hl);
++    HAPRawBufferCopyBytes(&out->data[out->position + hl], jpeg, len); // overlapping copy towards lower address
++    out->position += hl + len;
++    HAPLogInfo(&logObject, "POST /resource %ux%u -> %lu byte JPEG", width, height, (unsigned long) len);
+ }
+ 
+ static void put_prepare(HAPIPSessionDescriptor* session) {
+-- 
+2.54.0 (Apple Git-157)
+

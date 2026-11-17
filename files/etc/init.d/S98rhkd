@@ -1,0 +1,87 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# S98rhkd -- native HomeKit camera daemon (rhkd)
+#
+# Runs /usr/bin/rhkd under a small supervisor loop that restarts it if it exits, logging to syslog.
+# Settings: /etc/default/rhkd. Pairing store: $RHKD_STORE (default /etc/homekit/store).
+# Needs raptor (S31) and mdnsd (S50) running first.
+
+DAEMON=/usr/bin/rhkd
+DEFAULTS=/etc/default/rhkd
+SUPERVISOR_PID=/run/rhkd-supervisor.pid
+RESTART_DELAY=5
+
+[ -x "$DAEMON" ] || exit 0
+
+RHKD_ENABLED=true
+RHKD_STORE=/etc/homekit/store
+RHKD_NAME=
+RHKD_LOG_LEVEL=2
+# shellcheck disable=SC1090
+[ -f "$DEFAULTS" ] && . "$DEFAULTS"
+# Resolved here, not in start(): the supervisor re-runs this script, which resets and re-reads the settings.
+# Empty name = the camera's name (hostname).
+[ -n "$RHKD_NAME" ] || RHKD_NAME=$(hostname)
+[ -n "$RHKD_SERIAL" ] || RHKD_SERIAL=$(tr -d ':' </sys/class/net/wlan0/address 2>/dev/null)
+
+supervise() {
+	trap 'kill -TERM "$child" 2>/dev/null; wait "$child"; exit 0' TERM INT
+	while :; do
+		RHKD_STORE="$RHKD_STORE" RHKD_NAME="$RHKD_NAME" RHKD_SERIAL="$RHKD_SERIAL" \
+			RHKD_LOG_LEVEL="$RHKD_LOG_LEVEL" RHKD_SYSLOG=1 \
+			RHKD_VIDEO_RING="$RHKD_VIDEO_RING" RHKD_SNAPSHOT_RING="$RHKD_SNAPSHOT_RING" \
+			RHKD_MOTION_MIN_HITS="$RHKD_MOTION_MIN_HITS" RHKD_MOTION_WINDOW_MS="$RHKD_MOTION_WINDOW_MS" \
+			RHKD_MOTION_HOLD_SEC="$RHKD_MOTION_HOLD_SEC" RHKD_AUDIO_CLOCK="$RHKD_AUDIO_CLOCK" \
+			RHKD_ADAPT_BITRATE="$RHKD_ADAPT_BITRATE" RHKD_MIN_BITRATE_KBPS="$RHKD_MIN_BITRATE_KBPS" \
+			"$DAEMON" </dev/null >/dev/null 2>&1 &
+		child=$!
+		wait "$child"
+		code=$?
+		logger -t rhkd -p daemon.warn "rhkd exited ($code), restarting in ${RESTART_DELAY}s"
+		sleep "$RESTART_DELAY"
+	done
+}
+
+start() {
+	case "$RHKD_ENABLED" in true | 1 | yes) ;; *)
+		echo "rhkd disabled in $DEFAULTS"
+		return 0
+		;;
+	esac
+	if [ -f "$SUPERVISOR_PID" ] && kill -0 "$(cat "$SUPERVISOR_PID")" 2>/dev/null; then
+		echo "rhkd already running"
+		return 0
+	fi
+	mkdir -p "$RHKD_STORE"
+	chmod 700 "$(dirname "$RHKD_STORE")" "$RHKD_STORE"
+	# Own session (setsid), so the supervisor survives the shell or SSH session that ran the script.
+	setsid "$0" supervise </dev/null >/dev/null 2>&1 &
+	sleep 1
+	pid=$(pgrep -f "$0 supervise" 2>/dev/null | head -n 1)
+	[ -n "$pid" ] && echo "$pid" >"$SUPERVISOR_PID"
+	echo "rhkd started (\"$RHKD_NAME\", store $RHKD_STORE)"
+}
+
+stop() {
+	if [ -f "$SUPERVISOR_PID" ]; then
+		kill -TERM "$(cat "$SUPERVISOR_PID")" 2>/dev/null
+		rm -f "$SUPERVISOR_PID"
+	fi
+	sleep 1
+	killall rhkd 2>/dev/null
+	echo "rhkd stopped"
+}
+
+case "$1" in
+	supervise) supervise ;;
+	start) start ;;
+	stop) stop ;;
+	restart | reload)
+		stop
+		start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac

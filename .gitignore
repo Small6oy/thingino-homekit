@@ -1,0 +1,13 @@
+# Third-party sources fetched by deps.sh
+/src/HomeKitADK/
+/src/mbedtls/
+/src/raptor/
+/src/raptor-hal/
+/src/raptor-ipc/
+/src/raptor-common/
+
+# Build output
+/build/out/
+
+.DS_Store
+tools/udppace

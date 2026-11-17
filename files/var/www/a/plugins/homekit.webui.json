@@ -1,0 +1,16 @@
+{
+  "label": "HomeKit",
+  "name": "homekit",
+  "nav": [
+    {
+      "items": [
+        {
+          "href": "/config-homekit.html",
+          "label": "HomeKit"
+        }
+      ],
+      "position": "after:Home Assistant",
+      "section": "ddServices"
+    }
+  ]
+}

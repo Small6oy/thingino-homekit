@@ -1,0 +1,105 @@
+From d5d1efdd11c63bd59afbc51ef13210e2f1cd5a54 Mon Sep 17 00:00:00 2001
+From: deps <deps@localhost>
+Date: Tue, 17 Nov 2026 15:35:48 +1100
+Subject: [PATCH] HAPPlatformRandomNumber: fall back to /dev/urandom when
+ getrandom is ENOSYS
+
+Linux 3.10 (Ingenic T31, e.g. Wyze Cam v3) predates getrandom(2), so the
+syscall fails with ENOSYS and the ADK aborted at startup. Read /dev/urandom
+instead on such kernels; keep getrandom everywhere else. When built against
+kernel headers without SYS_getrandom/GRND_NONBLOCK (Thingino's T31 toolchain),
+take the same fallback path at compile time.
+---
+ PAL/POSIX/HAPPlatformRandomNumber.c | 48 +++++++++++++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+
+diff --git a/PAL/POSIX/HAPPlatformRandomNumber.c b/PAL/POSIX/HAPPlatformRandomNumber.c
+index cacf2d3..df20102 100644
+--- a/PAL/POSIX/HAPPlatformRandomNumber.c
++++ b/PAL/POSIX/HAPPlatformRandomNumber.c
+@@ -5,6 +5,7 @@
+ // See [CONTRIBUTORS.md] for the list of HomeKit ADK project authors.
+ 
+ #include <errno.h>
++#include <fcntl.h>
+ #include <linux/random.h>
+ #include <syscall.h>
+ #include <unistd.h>
+@@ -24,12 +25,46 @@
+ 
+ static const HAPLogObject logObject = { .subsystem = kHAPPlatform_LogSubsystem, .category = "RandomNumber" };
+ 
++/**
++ * Fallback for kernels without getrandom(2) (ENOSYS, e.g. Linux 3.10 on Ingenic T31): read /dev/urandom.
++ * On those kernels the urandom pool is seeded by the time userspace daemons start (seedrng runs at boot).
++ */
++static void FillFromDevURandom(void* bytes, size_t numBytes) {
++    int fd;
++    do {
++        fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
++    } while ((fd == -1) && (errno == EINTR));
++    if (fd < 0) {
++        HAPLogError(&logObject, "open /dev/urandom failed: %d.", errno);
++        HAPFatalError();
++    }
++    size_t o = 0;
++    while (o < numBytes) {
++        ssize_t n = read(fd, &((uint8_t*) bytes)[o], numBytes - o);
++        if (n < 0 && errno == EINTR) {
++            continue;
++        }
++        if (n <= 0) {
++            HAPLogError(&logObject, "read /dev/urandom failed: %d.", n < 0 ? errno : 0);
++            HAPFatalError();
++        }
++        o += (size_t) n;
++    }
++    (void) close(fd);
++}
++
+ void HAPPlatformRandomNumberFill(void* bytes, size_t numBytes) {
+     HAPPrecondition(bytes);
+ 
++    static bool useDevURandom = false;
++
+     // Read random data.
+     for (int i = 0; i < 5; i++) {
+         size_t o = 0;
++        if (useDevURandom) {
++            FillFromDevURandom(bytes, numBytes);
++            o = numBytes;
++        }
+         while (o < numBytes) {
+             size_t c = numBytes - o;
+ 
+@@ -41,6 +76,7 @@ void HAPPlatformRandomNumberFill(void* bytes, size_t numBytes) {
+             }
+ 
+             ssize_t n;
++#if defined(SYS_getrandom) && defined(GRND_NONBLOCK)
+             do {
+                 // Flags to call getrandom.
+                 const int getrandomFlags = GRND_NONBLOCK; // Use the urandom source and do not block.
+@@ -49,7 +85,19 @@ void HAPPlatformRandomNumberFill(void* bytes, size_t numBytes) {
+                 // Source: man page of getrandom(2).
+                 n = syscall(SYS_getrandom, &((uint8_t*) bytes)[o], c, getrandomFlags);
+             } while ((n == -1) && (errno == EINTR));
++#else
++            // Built against kernel headers older than 3.17 (no getrandom): same path as a runtime ENOSYS.
++            n = -1;
++            errno = ENOSYS;
++#endif
+ 
++            if (n < 0 && errno == ENOSYS) {
++                HAPLog(&logObject, "getrandom not supported by this kernel; using /dev/urandom.");
++                useDevURandom = true;
++                FillFromDevURandom(&((uint8_t*) bytes)[o], numBytes - o);
++                o = numBytes;
++                break;
++            }
+             if (n < 0) {
+                 int _errno = errno;
+                 HAPAssert(n == -1);
+-- 
+2.54.0 (Apple Git-157)
+

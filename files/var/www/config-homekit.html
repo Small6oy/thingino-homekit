@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark" data-asset-ts="1793609838">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>thingino · HomeKit</title>
+  <script src="/a/theme-init.js?ts=1793609838"></script>
+  <link rel="icon" type="image/svg+xml" href="/a/favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=swap" onerror="this.onerror=null;var l=document.createElement('link');l.rel='stylesheet';l.href='/a/vendor/montserrat.css';this.parentNode.insertBefore(l,this.nextSibling)">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css"
+    integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous" onerror="this.onerror=null;var l=document.createElement('link');l.rel='stylesheet';l.href='/a/vendor/bootstrap.min.css';this.parentNode.insertBefore(l,this.nextSibling)">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.13.1/font/bootstrap-icons.min.css" onerror="this.onerror=null;var l=document.createElement('link');l.rel='stylesheet';l.href='/a/vendor/bootstrap-icons.min.css';this.parentNode.insertBefore(l,this.nextSibling)">
+  <link rel="stylesheet" href="/a/main.css?ts=1793609838">
+<script src="/a/plugins.js?ts=1793609838"></script>
+  <style>
+    .hk-code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 2rem; letter-spacing: .15em; }
+    .hk-qr { background: #fff; padding: 12px; border-radius: 12px; display: inline-block; line-height: 0; }
+    .hk-qr svg { width: 200px; height: 200px; }
+    .hk-label { display: inline-flex; flex-direction: column; align-items: center; gap: .5rem; padding: 1rem;
+      border: 1px solid var(--bs-border-color); border-radius: 1rem; }
+    .hk-status dt { font-weight: 500; }
+  </style>
+</head>
+
+<body id="page-config-homekit">
+<nav data-app-nav></nav>
+
+<main class="pb-4">
+  <div class="container" style="min-height:80vh">
+    <div data-app-controls></div>
+
+    <section>
+      <div class="card mb-3">
+        <div class="card-header">
+          <h2 class="card-title">HomeKit</h2>
+          <small>Native Apple Home camera (rhkd): pairing status and setup code</small>
+          <button type="button" class="btn btn-outline-secondary" id="hk-reload" title="Reload status from camera">
+            <i class="bi bi-arrow-clockwise"></i> Reload
+          </button>
+        </div>
+        <div class="card-body">
+          <div class="row g-4">
+            <div class="col-12 col-lg-5">
+              <h4>Status</h4>
+              <dl class="row hk-status mb-0">
+                <dt class="col-5">Service</dt><dd class="col-7" id="hk-running">…</dd>
+                <dt class="col-5">Name in Home</dt><dd class="col-7" id="hk-name">…</dd>
+                <dt class="col-5">Paired</dt><dd class="col-7" id="hk-paired">…</dd>
+                <dt class="col-5">Discoverable</dt><dd class="col-7" id="hk-discoverable">…</dd>
+              </dl>
+              <p class="small text-body-secondary mt-2 mb-0" id="hk-details"></p>
+            </div>
+
+            <div class="col-12 col-lg-7">
+              <h4>Setup code</h4>
+              <p class="text-body-secondary mb-2" id="hk-hint">
+                In the Home app: <b>+</b> → <b>Add Accessory</b>, then scan this code
+                or choose <b>More options…</b> and enter the number.
+              </p>
+              <div id="hk-hidden">
+                <button type="button" class="btn btn-outline-primary" id="hk-show">
+                  <i class="bi bi-eye"></i> Show setup code
+                </button>
+              </div>
+              <div id="hk-shown" class="d-none">
+                <div class="hk-label">
+                  <div class="hk-qr" id="hk-qr" aria-label="HomeKit setup QR code"></div>
+                  <div class="hk-code" id="hk-code"></div>
+                </div>
+                <div class="mt-2">
+                  <button type="button" class="btn btn-sm btn-outline-secondary" id="hk-hide">
+                    <i class="bi bi-eye-slash"></i> Hide
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card mb-3">
+        <div class="card-header">
+          <h2 class="card-title">Compatibility</h2>
+          <small>HomeKit needs an H.264 video stream and Opus audio; the camera encodes, rhkd does not convert</small>
+        </div>
+        <div class="card-body">
+          <dl class="row hk-status mb-2">
+            <dt class="col-5 col-lg-3">Live view video</dt><dd class="col-7 col-lg-9" id="hk-video">…</dd>
+            <dt class="col-5 col-lg-3">Audio</dt><dd class="col-7 col-lg-9" id="hk-audio">…</dd>
+          </dl>
+          <div id="hk-fix-box" class="d-none">
+            <button type="button" class="btn btn-primary" id="hk-fix">
+              <i class="bi bi-magic"></i> Make compatible
+            </button>
+            <p class="text-body-secondary mt-3 mb-0" id="hk-fix-text"></p>
+          </div>
+        </div>
+      </div>
+
+      <div class="card mb-3">
+        <div class="card-header">
+          <h2 class="card-title">Pairing</h2>
+          <small>Changes take effect immediately; the HomeKit service restarts</small>
+        </div>
+        <div class="card-body">
+          <div class="d-flex flex-wrap gap-2">
+            <button type="button" class="btn btn-secondary" id="hk-restart">
+              <i class="bi bi-arrow-repeat"></i> Restart HomeKit service
+            </button>
+            <button type="button" class="btn btn-outline-warning" id="hk-unpair">
+              <i class="bi bi-link-45deg"></i> Unpair (keep setup code)
+            </button>
+            <button type="button" class="btn btn-outline-danger" id="hk-newcode">
+              <i class="bi bi-shuffle"></i> New setup code
+            </button>
+          </div>
+          <p class="text-body-secondary mt-3 mb-0">
+            <b>Unpair</b> forgets every Apple device and home hub paired with this camera, so it can be added again
+            with the same code. Remove the camera from the Home app too. <b>New setup code</b> also unpairs, and
+            makes the old code and printed labels useless.
+          </p>
+        </div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer data-app-footer></footer>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js"
+  integrity="sha384-FKyoEForCGlyvwx9Hj09JcYn3nv7wiPVlz7YYwJrWVcXK/BmnVDxM+D2scQbITxI" crossorigin="anonymous" onerror="this.onerror=null;var s=document.createElement('script');s.src='/a/vendor/bootstrap.bundle.min.js';document.head.appendChild(s)"></script>
+<script src="/a/main.js?ts=1793609838"></script>
+<script src="/a/runtime-config.js?ts=1793609838"></script>
+<script src="/a/control-bar.js?ts=1793609838"></script>
+<script src="/a/navigation.js?ts=1793609838"></script>
+<script src="/a/footer.js?ts=1793609838"></script>
+<script src="/a/vendor/qrcode.js"></script>
+<script src="/a/config-homekit.js?ts=1793609838"></script>
+</body>
+</html>
