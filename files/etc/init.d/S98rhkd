@@ -54,6 +54,12 @@ start() {
 	fi
 	mkdir -p "$RHKD_STORE"
 	chmod 700 "$(dirname "$RHKD_STORE")" "$RHKD_STORE"
+	# First start (fresh flash): create the setup code, and make the codecs HomeKit-compatible once
+	# (Opus audio, an H.264 stream). Later changes to the codecs are left alone.
+	if [ ! -f "$RHKD_STORE/40.10" ] && command -v rhkd-setup >/dev/null; then
+		rhkd-setup provision | logger -t rhkd-setup
+		rhkd-setup fixcodecs | logger -t rhkd-setup
+	fi
 	# Own session (setsid), so the supervisor survives the shell or SSH session that ran the script.
 	setsid "$0" supervise </dev/null >/dev/null 2>&1 &
 	sleep 1
