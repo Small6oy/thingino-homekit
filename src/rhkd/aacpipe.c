@@ -2,11 +2,15 @@
 // Opus -> PCM -> AAC-LC (see aacpipe.h).
 //
 // Threads: decode and encode may run on different threads; a mutex guards the PCM buffer and is never held
-// while faac runs. faac is double precision, so the binary's FP ABI must match the SoC (T41: FP64/NAN2008 via
+// while faac runs. faac 1.30 is double precision, so the binary's FP ABI must match the SoC (T41: FP64/NAN2008 via
 // SOC=xburst2 builds); an FP32 build broke on T41 worker threads (homekit.md "faac off the main thread").
 //
+// faac versions: the bundled faac 1.30 (legacy faacEnc* API) or faac >= 2 (faac_encoder_* API, as Thingino's faac
+// package ships it), picked by FAAC_VERSION_MAJOR, which only faac >= 2's header defines.
+//
 // Timing: the first PCM sample takes the packet's capture time; after that samples are counted, so AAC frames are
-// exactly 1024 samples apart. faac outputs with one frame of delay (its priming frame), which is subtracted. A gap
+// exactly 1024 samples apart. faac's priming delay (1024 samples in both versions: output k starts at input sample
+// k * 1024 - delay) is subtracted, and frames that start before sample 0 are dropped. A gap
 // or jump of more than 300 ms in the capture times restarts the count, so audio stays aligned with video after
 // a dropout.
 #include "aacpipe.h"
@@ -19,26 +23,87 @@
 #include "faac.h"
 #include "opus.h"
 
+#if defined(FAAC_VERSION_MAJOR) && FAAC_VERSION_MAJOR >= 2
+#define FAAC_V2 1
+#else
+#define FAAC_V2 0
+#endif
+
 #define MAX_OPUS_SAMPLES 5760 // 120 ms at 48 kHz: the largest Opus packet, at any decode rate
 #define RESYNC_US        300000
 #define PCM_MAX          32000 // 2 s at 16 kHz waiting for the encoder
 
 struct aacpipe {
     OpusDecoder* dec;
+#if FAAC_V2
+    faac_encoder* enc;
+    const uint8_t* asc; // owned by the encoder
+#else
     faacEncHandle enc;
-    uint32_t rate;
-    unsigned long inputSamples, maxOut;
     uint8_t* asc;
-    unsigned long ascLen;
+#endif
+    uint32_t rate;
+    uint32_t delay;     // encoder priming delay, samples
+    unsigned long maxOut;
+    size_t ascLen;
     pthread_mutex_t lock;
     int16_t pcm[PCM_MAX];
     size_t fill;          // samples waiting in pcm[]
     int64_t baseUs;       // capture time of sample 0 of the current run
     uint64_t inSamples;   // samples fed to faac in this run
-    uint64_t outFrames;   // AAC frames received in this run (including the priming frame)
+    uint64_t outFrames;   // AAC frames received in this run (including the priming ones)
     bool started;
     uint8_t* out;
 };
+
+// AAC-LC, MPEG-4, mono, raw frames (the MP4 carries the config in esds), no TNS or mid/side, 16-bit input.
+static bool OpenEncoder(aacpipe_t* p, uint32_t sampleRate, uint32_t bitrate) {
+#if FAAC_V2
+    faac_params prm;
+    if (faac_params_init(&prm, sizeof prm) != FAAC_OK)
+        return false;
+    prm.sample_rate = sampleRate;
+    prm.num_channels = 1;
+    prm.mpeg_version = FAAC_MPEG4;
+    prm.object_type = FAAC_OBJ_LOW;
+    prm.joint_mode = FAAC_JOINT_NONE;
+    prm.use_tns = false;
+    prm.bit_rate = bitrate; // per channel; mono
+    prm.bandwidth = 0;
+    prm.output_format = FAAC_STREAM_RAW;
+    prm.input_format = FAAC_INPUT_16BIT;
+    if (faac_encoder_open(&prm, &p->enc) != FAAC_OK)
+        return false;
+    faac_encoder_info info = { .struct_size = sizeof info };
+    uint32_t ascLen = 0;
+    if (faac_encoder_get_info(p->enc, &info) != FAAC_OK || info.frame_samples != AACPIPE_FRAME_SAMPLES ||
+        info.object_type != FAAC_OBJ_LOW || faac_encoder_asc(p->enc, &p->asc, &ascLen) != FAAC_OK)
+        return false;
+    p->maxOut = info.max_output_bytes;
+    p->delay = info.encoder_delay;
+    p->ascLen = ascLen;
+    return true;
+#else
+    unsigned long inputSamples = 0, ascLen = 0;
+    p->enc = faacEncOpen(sampleRate, 1, &inputSamples, &p->maxOut);
+    if (!p->enc || inputSamples != AACPIPE_FRAME_SAMPLES)
+        return false;
+    faacEncConfigurationPtr cfg = faacEncGetCurrentConfiguration(p->enc);
+    cfg->aacObjectType = LOW;
+    cfg->mpegVersion = MPEG4;
+    cfg->useTns = 0;
+    cfg->allowMidside = 0;
+    cfg->bitRate = bitrate;
+    cfg->bandWidth = 0;
+    cfg->outputFormat = 0;
+    cfg->inputFormat = FAAC_INPUT_16BIT;
+    if (!faacEncSetConfiguration(p->enc, cfg) || faacEncGetDecoderSpecificInfo(p->enc, &p->asc, &ascLen))
+        return false;
+    p->ascLen = ascLen;
+    p->delay = AACPIPE_FRAME_SAMPLES; // one priming frame
+    return true;
+#endif
+}
 
 aacpipe_t* aacpipe_open(uint32_t sampleRate, uint32_t bitrate) {
     aacpipe_t* p = calloc(1, sizeof *p);
@@ -48,21 +113,7 @@ aacpipe_t* aacpipe_open(uint32_t sampleRate, uint32_t bitrate) {
     p->rate = sampleRate;
     pthread_mutex_init(&p->lock, NULL);
     p->dec = opus_decoder_create((opus_int32) sampleRate, 1, &err);
-    p->enc = faacEncOpen(sampleRate, 1, &p->inputSamples, &p->maxOut);
-    if (!p->dec || err != OPUS_OK || !p->enc || p->inputSamples != AACPIPE_FRAME_SAMPLES) {
-        aacpipe_close(p);
-        return NULL;
-    }
-    faacEncConfigurationPtr cfg = faacEncGetCurrentConfiguration(p->enc);
-    cfg->aacObjectType = LOW;
-    cfg->mpegVersion = MPEG4;
-    cfg->useTns = 0;
-    cfg->allowMidside = 0;
-    cfg->bitRate = bitrate ? bitrate : 32000;
-    cfg->bandWidth = 0;
-    cfg->outputFormat = 0; // raw AAC (the MP4 carries the config in esds)
-    cfg->inputFormat = FAAC_INPUT_16BIT;
-    if (!faacEncSetConfiguration(p->enc, cfg) || faacEncGetDecoderSpecificInfo(p->enc, &p->asc, &p->ascLen) ||
+    if (!p->dec || err != OPUS_OK || !OpenEncoder(p, sampleRate, bitrate ? bitrate : 32000) ||
         !(p->out = malloc(p->maxOut))) {
         aacpipe_close(p);
         return NULL;
@@ -75,9 +126,13 @@ void aacpipe_close(aacpipe_t* p) {
         return;
     if (p->dec)
         opus_decoder_destroy(p->dec);
+#if FAAC_V2
+    faac_encoder_close(&p->enc);
+#else
     if (p->enc)
         faacEncClose(p->enc);
     free(p->asc);
+#endif
     free(p->out);
     pthread_mutex_destroy(&p->lock);
     free(p);
@@ -106,14 +161,21 @@ static int Encode(aacpipe_t* p, aacpipe_out_fn out, void* ctx) {
         int64_t baseUs = p->baseUs;
         pthread_mutex_unlock(&p->lock);
 
+#if FAAC_V2
+        uint32_t written = 0;
+        faac_status st = faac_encoder_encode(p->enc, block, AACPIPE_FRAME_SAMPLES, p->out, (uint32_t) p->maxOut,
+                                             &written);
+        int n = st == FAAC_OK ? (int) written : -1;
+#else
         int n = faacEncEncode(p->enc, (int32_t*) block, AACPIPE_FRAME_SAMPLES, p->out, (unsigned int) p->maxOut);
+#endif
         if (n <= 0)
-            continue; // still priming
-        // Output k (k >= 1 after the priming frame) holds input samples starting at (k - 1) * 1024.
+            continue; // still filling the encoder's lookahead
+        // Output k holds input samples starting at k * 1024 - delay; drop those that start before sample 0.
         uint64_t k = p->outFrames++;
-        if (k == 0)
-            continue; // drop the priming frame
-        int64_t ts = baseUs + (int64_t) ((k - 1) * AACPIPE_FRAME_SAMPLES * 1000000ULL / p->rate);
+        if (k * AACPIPE_FRAME_SAMPLES < p->delay)
+            continue;
+        int64_t ts = baseUs + (int64_t) ((k * AACPIPE_FRAME_SAMPLES - p->delay) * 1000000ULL / p->rate);
         out(ctx, p->out, (size_t) n, ts);
         emitted++;
     }

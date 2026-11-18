@@ -6,8 +6,10 @@
 #   rhkd-setup unpair     forget all controllers (keeps the setup code); the camera can be added again
 #   rhkd-setup newcode    new setup code and setup ID (also unpairs)
 #   rhkd-setup provision  create a store with a new setup code if there is none (used by install/boot)
-#   rhkd-setup codecs     JSON: camera codecs and whether HomeKit can use them (H.264 video, Opus audio)
-#   rhkd-setup fixcodecs  make them HomeKit-compatible: audio -> opus; if neither stream is H.264, sub -> h264.
+#   rhkd-setup codecs     JSON: camera codecs and whether HomeKit can use them (H.264 video, Opus audio on rad's
+#                         "audio" or, with rad's dual-codec output, "audio2")
+#   rhkd-setup fixcodecs  make them HomeKit-compatible: if neither audio output is Opus, audio -> opus; if neither
+#                         stream is H.264, sub -> h264.
 #                         Applied live and saved to raptor.conf; the RTSP server restarts so clients re-read SDP.
 #
 # Store layout (HomeKitADK POSIX key-value store, files named <domain>.<key> in hex):
@@ -52,23 +54,40 @@ video_codec() {
 	case "$c" in 0) echo h264 ;; 1) echo h265 ;; '') ;; *) echo "codec$c" ;; esac
 }
 
-audio_codec() { raptorctl rad status 2>/dev/null | sed -n 's/.*"codec":"\([a-z0-9]*\)".*/\1/p'; }
+# Main output's codec. Multi-output rad also has "codec" inside its "outputs" array, so drop that first.
+audio_codec() { raptorctl rad status 2>/dev/null | sed -e 's/"outputs":\[[^]]*\]//' -n -e 's/.*"codec":"\([a-z0-9]*\)".*/\1/p'; }
+# rad's extra audio outputs as "ring:codec" lines. Multi-output rad reports
+#   "outputs":[{"ring":"audio2","codec":"opus",...},{"ring":"audio3","codec":"aac",...}];
+# the earlier dual-codec build reported "codec2":"<codec>" for ring audio2. Empty without extra outputs.
+audio_outputs() {
+	st=$(raptorctl rad status 2>/dev/null)
+	echo "$st" | grep -o '"ring":"[a-z0-9]*","codec":"[a-z0-9]*"' | sed 's/"ring":"\([a-z0-9]*\)","codec":"\([a-z0-9]*\)"/\1:\2/'
+	echo "$st" | sed -n 's/.*"codec2":"\([a-z0-9]*\)".*/audio2:\1/p'
+}
+# Codec of extra output ring $1 (e.g. audio2), or empty.
+output_codec() { audio_outputs | sed -n "s/^$1://p" | head -n 1; }
+# Live view needs Opus on the main output or on any extra one.
+opus_ok() { [ "$(audio_codec)" = opus ] || audio_outputs | grep -q ':opus$'; }
 
 codecs() {
 	a=$(audio_codec)
+	a2=$(output_codec audio2)
+	a3=$(output_codec audio3)
 	m=$(video_codec 0)
 	s=$(video_codec 1)
 	vok=false
 	{ [ "$m" = h264 ] || [ "$s" = h264 ]; } && vok=true
 	mot=false
 	raptorctl rvd ivs-status 2>/dev/null | grep -q '"active":true' && mot=true
-	printf '{"audio":%s,"main":%s,"sub":%s,"video_ok":%s,"audio_ok":%s,"motion":%s}' "$(json_str "$a")" "$(json_str "$m")" \
-		"$(json_str "$s")" "$vok" "$([ "$a" = opus ] && echo true || echo false)" "$mot"
+	aok=false
+	opus_ok && aok=true
+	printf '{"audio":%s,"audio2":%s,"audio3":%s,"main":%s,"sub":%s,"video_ok":%s,"audio_ok":%s,"motion":%s}' \
+		"$(json_str "$a")" "$(json_str "$a2")" "$(json_str "$a3")" "$(json_str "$m")" "$(json_str "$s")" "$vok" "$aok" "$mot"
 }
 
 fixcodecs() {
 	changed=
-	if [ "$(audio_codec)" != opus ]; then
+	if ! opus_ok; then
 		raptorctl rad set-codec opus >/dev/null && raptorctl config set audio codec opus >/dev/null || return 1
 		logger -t rhkd-setup "audio codec set to opus for HomeKit"
 		changed=1

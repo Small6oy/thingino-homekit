@@ -1,7 +1,8 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Incremental cross-build on the remote Docker host.
-# Usage: [SOC=xburst1|xburst2] build/docker-build.sh [make args]   (run from the homekit/ folder)
+# Usage: [SOC=xburst1|xburst2] [TRANSCODE=0|1] build/docker-build.sh [make args]   (run from the homekit/ folder)
+# TRANSCODE (default 0 here, 1 in the Makefile): include the Opus -> AAC recording fallback (libopus + faac).
 #   xburst1 (default): T31 (Wyze v3). musl.cc toolchain, FP32 / legacy NaN.                        -> build/out/
 #   xburst2:           T41 (Wyze v4). Thingino's xburst2 musl toolchain, FP64 / NAN2008 (as the firmware). -> build/out-xburst2/
 # The two FP ABIs are NOT interchangeable: FP32 double code broke on T41 worker threads (homekit.md).
@@ -34,7 +35,7 @@ fi"
 # 3. Compile in the container on the host tree (bind mount of a host path).
 RHOME=$(ssh "$HOST" 'echo $HOME')
 docker run --rm -u "$(ssh "$HOST" 'id -u'):$(ssh "$HOST" 'id -g')" -v "$RHOME/$RDIR:/work" -w /work/build "$IMAGE" \
-	sh -c "make -j\$(nproc) $CROSSARG OUT=$OUTDIR $* >&2"
+	sh -c "make -j\$(nproc) $CROSSARG OUT=$OUTDIR TRANSCODE=${TRANSCODE:-0} $* >&2"
 
 # 4. Fetch the binaries.
 mkdir -p build/$OUTDIR

@@ -23,6 +23,7 @@
 #include "opmode.h"
 #include "hds.h"
 #include "recording.h"
+#include "rss_ipc.h"
 
 #include "App.h"
 #include "DB.h"
@@ -474,6 +475,23 @@ static HAPError HandleSetupEndpointsWrite(
     return kHAPError_None;
 }
 
+// The rad ring carrying Opus for live view. With rad's dual-codec output the main "audio" ring can be AAC (stock
+// consumers, HKSV) and Opus sits in "audio2", encoded on demand while a reader holds it; otherwise "audio" is Opus.
+// Falls back to "audio", where the stream thread reports a wrong codec instead of sending it.
+static const char* OpusRingName(void) {
+    static const char* const names[] = { "audio2", "audio3", "audio" };
+    for (unsigned i = 0; i < 3; i++) {
+        rss_ring_t* ring = rss_ring_open(names[i]);
+        if (!ring)
+            continue;
+        bool opus = rss_ring_version_ok(ring, NULL) && rss_ring_get_header(ring)->codec == 111;
+        rss_ring_close(ring);
+        if (opus)
+            return names[i];
+    }
+    return "audio";
+}
+
 static HAPError HandleSelectedRead(
         HAPAccessoryServerRef* server HAP_UNUSED,
         const HAPTLV8CharacteristicReadRequest* request HAP_UNUSED,
@@ -571,7 +589,7 @@ static HAPError HandleSelectedWrite(
                     tlv_get_u8(artp, artpLen, 0x01, &apt);
                 p->audioPayloadType = apt;
                 p->audioPacketMs = aptime;
-                p->audioRingName = "audio";
+                p->audioRingName = OpusRingName();
                 // RTP clock: HomeKit times Opus by the negotiated sample rate (as Scrypted does), not RFC 7587's
                 // 48 kHz. RHKD_AUDIO_CLOCK=48000 forces the RFC clock for A/B tests.
                 p->audioClockHz = asr == 0 ? 8000 : asr == 2 ? 24000 : 16000;

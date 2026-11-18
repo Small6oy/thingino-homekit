@@ -17,9 +17,9 @@
 // {dataType mediaInitialization|mediaFragment, dataSequenceNumber, dataChunkSequenceNumber, isLastDataChunk,
 // dataTotalSize (first chunk)}}], endOfStream (last chunk only)}, chunks of at most 256 KiB.
 //
-// Audio (RecordingAudioActive): preferably rad's second output ring "audio2" (rad dual-codec: raw AAC-LC access
-// units, 16 kHz mono, 1024 samples per frame, timestamps on the same capture clock), used as is. Without it (older
-// rad), the reader decodes the Opus ring "audio" (live view's codec) and encodes AAC-LC itself (aacpipe.c). Either
+// Audio (RecordingAudioActive): a rad ring carrying AAC-LC 16 kHz mono with 1024-sample frames ("audio", as
+// Thingino ships rad, or "audio2" with rad's dual-codec output) is used as is. Otherwise the reader decodes whichever
+// ring carries Opus and encodes AAC-LC itself (aacpipe.c). Either
 // way the AAC frames go into a second queue, and each fragment carries those captured during its video span as
 // track 2.
 
@@ -33,8 +33,18 @@
 #include <unistd.h>
 
 #include "HAP.h"
-#include "aacpipe.h"
 #include "fmp4.h"
+
+// RHKD_TRANSCODE=0 (build/Makefile TRANSCODE=0) leaves out the Opus -> AAC fallback with libopus and faac.
+#ifndef RHKD_TRANSCODE
+#define RHKD_TRANSCODE 1
+#endif
+#if RHKD_TRANSCODE
+#include "aacpipe.h"
+#else
+typedef struct aacpipe aacpipe_t;
+#define AACPIPE_FRAME_SAMPLES 1024
+#endif
 #include "rss_ipc.h"
 
 static const HAPLogObject logObject = { .subsystem = "rhkd", .category = "Recorder" };
@@ -86,9 +96,11 @@ static aframe_t *aHead, *aTail; // AAC frames (same lock)
 static uint8_t aAsc[16];
 static size_t aAscLen;          // > 0 once the AAC encoder is running
 
-// The AAC encoder (created in recorder_set_audio, used by the reader thread). faac is double precision: the
-// binary's FP ABI must match the SoC (T41 = FP64/NAN2008), or it breaks on worker threads (homekit.md).
+#if RHKD_TRANSCODE
+// The AAC encoder (created and used by the reader thread, only for the Opus fallback). faac is double precision:
+// the binary's FP ABI must match the SoC (T41 = FP64/NAN2008), or it breaks on worker threads (homekit.md).
 static aacpipe_t* gPipe;
+#endif
 // --- clock alignment -------------------------------------------------------------------------------------------------
 // rad stamps audio from a sample clock that drifts against the video capture clock (seen: audio 6 s ahead after
 // ~1 h on the T31). Both rings are compared with CLOCK_MONOTONIC_RAW: the smallest (now - timestamp) over a
@@ -232,19 +244,21 @@ static bool MakeAsc(unsigned aot, uint32_t rate, uint8_t out[2]) {
     return false;
 }
 
-// Opens rad's AAC ring if it's there and matches what HKSV selected (AAC-LC, 1024-sample frames, AUDIO_RATE).
-static bool OpenDirect(audio_in_t* a) {
-    rss_ring_t* ring = rss_ring_open("audio2");
+// Opens rad ring @name if it carries what HKSV selected (AAC-LC, 1024-sample frames, AUDIO_RATE), used as is.
+// rad publishes "audio" and, with its dual-codec support, "audio2"; either may be the AAC one.
+static bool OpenDirect(audio_in_t* a, const char* name) {
+    rss_ring_t* ring = rss_ring_open(name);
     if (!ring)
-        return false; // rad without a second codec output
-    rss_stream_info_t info;
+        return false; // no such ring (e.g. rad without a second codec output)
+    rss_stream_info_t info = { 0 };
     uint8_t asc[2];
     bool ok = rss_ring_version_ok(ring, NULL) && rss_ring_get_stream_info(ring, &info) == 0 && info.codec == 97 &&
               info.profile == 2 && info.width == AACPIPE_FRAME_SAMPLES && info.fps_num == AUDIO_RATE &&
               MakeAsc(2, info.fps_num, asc);
     if (!ok) {
-        HAPLogInfo(&logObject, "audio2 ring isn't AAC-LC %u Hz / 1024 (codec %u, aot %u, %u Hz); using the Opus ring",
-                   AUDIO_RATE, (unsigned) info.codec, (unsigned) info.profile, (unsigned) info.fps_num);
+        if (info.codec == 97)
+            HAPLogInfo(&logObject, "%s ring is AAC but not AAC-LC %u Hz / 1024 (aot %u, %u Hz, %u samples)", name,
+                       AUDIO_RATE, (unsigned) info.profile, (unsigned) info.fps_num, (unsigned) info.width);
         rss_ring_close(ring);
         return false;
     }
@@ -264,17 +278,35 @@ static bool OpenDirect(audio_in_t* a) {
     memcpy(aAsc, asc, 2);
     aAscLen = 2;
     pthread_mutex_unlock(&qLock);
-    HAPLogInfo(&logObject, "recording audio: rad AAC ring audio2 (AAC-LC %u Hz mono, no transcoding), ASC %02X%02X",
+    HAPLogInfo(&logObject, "recording audio: rad AAC ring %s (AAC-LC %u Hz mono, no transcoding), ASC %02X%02X", name,
                AUDIO_RATE, asc[0], asc[1]);
     return true;
 }
+
+#if RHKD_TRANSCODE
+// The first rad ring carrying Opus (for the transcoding fallback), or NULL.
+static rss_ring_t* OpenOpus(const char** nameOut) {
+    static const char* const names[] = { "audio2", "audio3", "audio" };
+    for (unsigned i = 0; i < 3; i++) {
+        rss_ring_t* ring = rss_ring_open(names[i]);
+        if (!ring)
+            continue;
+        if (rss_ring_version_ok(ring, NULL) && rss_ring_get_header(ring)->codec == 111) {
+            *nameOut = names[i];
+            return ring;
+        }
+        rss_ring_close(ring);
+    }
+    return NULL;
+}
+#endif
 
 static void AudioClose(audio_in_t* a) {
     if (a->ring) {
         rss_ring_release(a->ring);
         rss_ring_close(a->ring);
     }
-    free(a->buf); // the pipe belongs to recorder_set_audio
+    free(a->buf); // the pipe (gPipe) is kept for the next recording
     memset(a, 0, sizeof *a);
     pthread_mutex_lock(&qLock);
     aAscLen = 0;
@@ -293,17 +325,28 @@ static void AudioPump(audio_in_t* a) {
         if (NowMs() < a->retryAt)
             return;
         a->retryAt = NowMs() + 5000;
-        if (OpenDirect(a))
+        // rad's AAC outputs, best first: "audio3" (on-demand AAC at a recording bitrate, three-output rad), the main
+        // "audio" (Thingino ships it as AAC), "audio2".
+        if (OpenDirect(a, "audio3") || OpenDirect(a, "audio") || OpenDirect(a, "audio2"))
             goto read;
-        a->ring = rss_ring_open("audio");
-        if (!a->ring || !rss_ring_version_ok(a->ring, NULL) || rss_ring_get_header(a->ring)->codec != 111) {
-            if (a->ring) {
-                HAPLogError(&logObject, "audio ring is codec %u, not Opus (111): recordings stay silent",
-                            (unsigned) rss_ring_get_header(a->ring)->codec);
-                rss_ring_close(a->ring);
-                a->ring = NULL;
-            }
+#if !RHKD_TRANSCODE
+        HAPLogError(&logObject, "no rad ring carries AAC-LC %u Hz mono (set [audio3] codec = aac in raptor.conf); "
+                    "this rhkd is built without Opus transcoding: recordings stay silent", AUDIO_RATE);
+        return;
+#else
+        const char* opusName = NULL;
+        a->ring = OpenOpus(&opusName);
+        if (!a->ring) {
+            HAPLogError(&logObject, "no rad ring carries AAC-LC 16 kHz or Opus: recordings stay silent");
             return;
+        }
+        HAPLogInfo(&logObject, "recording audio: transcoding the Opus ring %s", opusName);
+        // The AAC encoder is created only here, when rad has no AAC ring: faac's state is ~10 MB (per-channel
+        // arrays for up to 64 channels), too much to keep around on a camera where it isn't used. Needs an FP ABI
+        // matching the SoC for faac on this thread (homekit.md). Kept once created.
+        if (!gPipe) {
+            uint32_t bitrate = atomic_load(&r.audioBitrate);
+            gPipe = aacpipe_open(AUDIO_RATE, bitrate < 24000 ? 24000 : bitrate);
         }
         a->pipe = gPipe;
         a->max = rss_ring_max_frame_size(a->ring);
@@ -323,6 +366,7 @@ static void AudioPump(audio_in_t* a) {
         pthread_mutex_unlock(&qLock);
         HAPLogInfo(&logObject, "recording audio: Opus ring -> AAC-LC %u Hz mono, ASC %02X%02X", AUDIO_RATE,
                    n > 0 ? asc[0] : 0, n > 1 ? asc[1] : 0);
+#endif
     }
 read:
     for (;;) {
@@ -340,8 +384,10 @@ read:
         pthread_mutex_unlock(&qLock);
         if (a->direct)
             OnAac(NULL, a->buf, len, meta.timestamp); // one raw AAC-LC access unit per slot
+#if RHKD_TRANSCODE
         else if (aacpipe_decode(a->pipe, a->buf, len, meta.timestamp) >= AACPIPE_FRAME_SAMPLES)
             (void) aacpipe_encode(a->pipe, OnAac, NULL);
+#endif
     }
     if (rss_ring_stale(a->ring))
         AudioClose(a);
@@ -718,13 +764,7 @@ void recorder_set_active(bool on, uint32_t prebufferMs, uint32_t fragmentMs) {
 
 void recorder_set_audio(bool on, uint32_t bitrate) {
     atomic_store(&r.audioBitrate, bitrate);
-    if (on && !gPipe) { // only needed without rad's AAC ring, but cheap to have ready
-        gPipe = aacpipe_open(AUDIO_RATE, bitrate < 24000 ? 24000 : bitrate);
-        if (!gPipe)
-            HAPLogError(&logObject, "could not create the AAC encoder; audio needs rad's audio2 ring");
-    }
-    atomic_store(&r.audioOn, on);
-    // The pipe is kept once created (tiny), so the reader never sees it disappear.
+    atomic_store(&r.audioOn, on); // the AAC encoder, if needed at all, is created by the reader (AudioPump)
 }
 
 bool recorder_busy(void) {

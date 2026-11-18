@@ -46,7 +46,7 @@
       el("hk-video").innerHTML = bad(streams + " — no H.264 stream, live view will not start");
     }
     el("hk-audio").innerHTML = c.audio_ok
-      ? ok("Opus")
+      ? ok(c.audio === "opus" ? "Opus" : `Opus on the second audio output (main: ${name(c.audio)})`)
       : bad(`${name(c.audio)} — HomeKit audio is off (needs Opus)`);
     el("hk-motion").innerHTML = c.motion
       ? ok("Motion detection on")

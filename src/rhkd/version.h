@@ -4,5 +4,5 @@
 // ("Firmware must not be downgraded"). Format: major.minor.revision (all numeric).
 #ifndef RHKD_VERSION_H
 #define RHKD_VERSION_H
-#define RHKD_VERSION "0.7.2"
+#define RHKD_VERSION "0.7.7"
 #endif
