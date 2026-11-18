@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# rhkd build image for XBurst2 (T41: Wyze v4). Uses Thingino's own xburst2 musl toolchain, whose defaults are
+# FP64 (-mfp64) and NAN2008, as Thingino builds everything for T41 (configs/fragments/soc-xburst2.fragment).
+# The generic musl.cc toolchain in Dockerfile is FP32 / legacy NaN, which matches XBurst1 (T31) only: on the
+# T41 its double-precision code broke on worker threads (faac, see homekit.md "faac off the main thread").
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends make curl ca-certificates xz-utils python3 file && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://github.com/themactep/thingino-firmware/releases/download/toolchain-x86_64/thingino-toolchain-x86_64_xburst2_musl_gcc15-linux-mipsel.tar.gz \
+    | tar -xz -C /opt && ln -s /opt/$(ls /opt | head -1) /opt/tc && ls /opt/tc/bin | grep -- '-gcc$'
+ENV PATH=/opt/tc/bin:$PATH
+WORKDIR /work

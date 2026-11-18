@@ -5,9 +5,12 @@
 /src/raptor-hal/
 /src/raptor-ipc/
 /src/raptor-common/
+/src/opus/
+/src/faac/
 
 # Build output
 /build/out/
+/build/out-xburst2/
 
 .DS_Store
 tools/udppace

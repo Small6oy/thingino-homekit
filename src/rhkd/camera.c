@@ -20,6 +20,9 @@
 #include "HAPUUID.h"
 #include "version.h"
 #include "motion.h"
+#include "opmode.h"
+#include "hds.h"
+#include "recording.h"
 
 #include "App.h"
 #include "DB.h"
@@ -82,6 +85,12 @@ static bool micMuted = false;
 // ---------------------------------------------------------------------------------------------------------------------
 // Helpers
 
+// Streaming is refused while the RTP service is inactive or the camera is turned off in Home (HomeKitCameraActive),
+// as HAP-NodeJS RTPStreamManagement.streamingIsDisabled does.
+static bool StreamingDisabled(void) {
+    return !cam.active || !opmode_homekit_active();
+}
+
 // Appends every top-level item of a raw TLV buffer to an ADK TLV writer.
 static HAPError EmitRaw(HAPTLVWriterRef* w, const uint8_t* buf, size_t len) {
     static uint8_t val[1024];
@@ -130,6 +139,7 @@ static void EndSession(const char* why) {
     cam.setupSession = NULL;
     cam.selectedLen = 0;
     bitrate_restore();
+    opmode_stream_ended();
     SetStreamingStatus(kStreamingStatus_Available);
 }
 
@@ -299,6 +309,10 @@ static HAPError HandleSetupEndpointsRead(
         const HAPTLV8CharacteristicReadRequest* request HAP_UNUSED,
         HAPTLVWriterRef* w,
         void* _Nullable context HAP_UNUSED) {
+    if (StreamingDisabled()) {
+        uint8_t status = kSetupStatus_Error; // as HAP-NodeJS while streaming is disabled
+        return HAPTLVWriterAppend(w, &(const HAPTLV) { .type = 0x02, .value = { .bytes = &status, .numBytes = 1 } });
+    }
     if (!cam.setupResponseLen)
         return kHAPError_None; // empty until a controller sets up endpoints (as HAP-NodeJS does)
     return EmitRaw(w, cam.setupResponse, cam.setupResponseLen);
@@ -326,6 +340,10 @@ static HAPError HandleSetupEndpointsWrite(
         const HAPTLV8CharacteristicWriteRequest* request,
         HAPTLVReaderRef* r,
         void* _Nullable context HAP_UNUSED) {
+    if (StreamingDisabled()) {
+        HAPLogInfo(&logObject, "SetupEndpoints refused: streaming is disabled.");
+        return kHAPError_InvalidState;
+    }
     uint8_t req[512];
     size_t reqLen;
     if (!CollectWrite(r, req, sizeof req, &reqLen))
@@ -461,6 +479,11 @@ static HAPError HandleSelectedRead(
         const HAPTLV8CharacteristicReadRequest* request HAP_UNUSED,
         HAPTLVWriterRef* w,
         void* _Nullable context HAP_UNUSED) {
+    if (StreamingDisabled()) {
+        // HAP-NodeJS answers {01 session control {02 command = suspend}} while streaming is disabled.
+        const uint8_t suspend[] = { 0x02, 0x01, kCmd_Suspend };
+        return HAPTLVWriterAppend(w, &(const HAPTLV) { .type = 0x01, .value = { .bytes = suspend, .numBytes = sizeof suspend } });
+    }
     if (!cam.selectedLen)
         return kHAPError_None; // empty until a stream is selected (as HAP-NodeJS does)
     return EmitRaw(w, cam.selected, cam.selectedLen);
@@ -485,6 +508,10 @@ static HAPError HandleSelectedWrite(
     HAPLogInfo(&logObject, "SelectedRTPStreamConfiguration: command %u.", cmd);
     switch (cmd) {
         case kCmd_Start: {
+            if (StreamingDisabled()) {
+                HAPLogInfo(&logObject, "Start refused: streaming is disabled.");
+                return kHAPError_InvalidState;
+            }
             if (!cam.haveSetup || cam.stream) {
                 HAPLogError(&logObject, "Start without a pending setup.");
                 return kHAPError_InvalidState;
@@ -575,6 +602,7 @@ static HAPError HandleSelectedWrite(
             }
             cam.streamSession = request->session;
             bitrate_apply(p->ringName, p->maxBitrateKbps);
+            opmode_stream_started();
             if (reqLen <= sizeof cam.selected) {
                 memcpy(cam.selected, req, reqLen);
                 cam.selectedLen = reqLen;
@@ -640,8 +668,14 @@ static HAPError HandleActiveWrite(
 // ---------------------------------------------------------------------------------------------------------------------
 // Snapshot hook used by the patched ADK POST /resource handler.
 
-size_t HAPCameraTakeSnapshot(uint16_t width, uint16_t height, uint8_t* bytes, size_t maxBytes) {
-    HAPLogInfo(&logObject, "Snapshot requested %ux%u.", width, height);
+size_t HAPCameraTakeSnapshot(uint16_t width, uint16_t height, int reason, uint8_t* bytes, size_t maxBytes) {
+    HAPLogInfo(&logObject, "Snapshot requested %ux%u (reason %d).", width, height, reason);
+    // As HAP-NodeJS CameraController.handleSnapshotRequest: no snapshots while streaming is off or the
+    // operating mode forbids this kind of snapshot.
+    if (!cam.active || !opmode_snapshot_allowed(reason)) {
+        HAPLogInfo(&logObject, "Snapshot refused by the operating mode.");
+        return 0;
+    }
     // The T41 main-resolution JPEG channel (jpeg0) produces no frames, so default to the
     // 640x360 substream JPEG; iOS scales it. Override with RHKD_SNAPSHOT_RING.
     const char* ring = getenv("RHKD_SNAPSHOT_RING");
@@ -817,7 +851,7 @@ static HAPError HandleMotionStatusActiveRead(
         const HAPBoolCharacteristicReadRequest* request HAP_UNUSED,
         bool* value,
         void* _Nullable context HAP_UNUSED) {
-    *value = motion_available();
+    *value = motion_available() && opmode_homekit_active(); // HAP-NodeJS mirrors HomeKitCameraActive here
     return kHAPError_None;
 }
 
@@ -878,6 +912,9 @@ static HAPAccessory accessory = {
                                               &cameraService,
                                               &microphoneService,
                                               &motionService,
+                                              &operatingModeService,
+                                              &dataStreamService,
+                                              &recordingService,
                                               NULL },
     .callbacks = { .identify = IdentifyAccessory },
 };
@@ -890,6 +927,7 @@ static void Watchdog(HAPPlatformTimerRef timer HAP_UNUSED, void* _Nullable conte
 }
 
 static void HandleSessionInvalidate(HAPAccessoryServerRef* server HAP_UNUSED, HAPSessionRef* session, void* _Nullable ctx HAP_UNUSED) {
+    hds_session_invalidated(session);
     if (cam.stream && session == cam.streamSession)
         EndSession("HAP session closed");
     else if (!cam.stream && cam.haveSetup && session == cam.setupSession)
@@ -917,7 +955,7 @@ void AppRelease(void) {
 }
 
 // Bump this whenever services or characteristics change, so controllers re-read /accessories.
-#define kDBRevision ((uint32_t) 4)
+#define kDBRevision ((uint32_t) 7)
 #define kAppKVSDomain ((HAPPlatformKeyValueStoreDomain) 0x00)
 #define kAppKVSKey_DBRevision ((HAPPlatformKeyValueStoreKey) 0x01)
 
@@ -951,8 +989,21 @@ static void MotionChanged(bool motion, bool available) {
     (void) available;
 }
 
+// Runs on the HAP run loop when the camera is turned on or off in Home.
+static void OperatingModeChanged(bool homeKitActive) {
+    if (!homeKitActive) {
+        EndSession("camera turned off in Home");
+        recording_camera_disabled();
+    }
+    // StatusActive mirrors HomeKitCameraActive; StreamingStatus/SetupEndpoints reads change with it.
+    MotionChanged(motion_detected(), motion_available());
+}
+
 void AppAccessoryServerStart(void) {
     BumpConfigurationNumberIfDBChanged();
+    opmode_init(cam.server, cam.keyValueStore, OperatingModeChanged);
+    recording_init(cam.server, cam.keyValueStore);
+    hds_init(recording_hds_message, recording_hds_closed);
     bitrate_recover();
     HAPAccessoryServerStart(cam.server, &accessory);
     if (motion_start(MotionChanged, 500))

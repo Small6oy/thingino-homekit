@@ -23,9 +23,21 @@ static const HAPLogObject logObject = { .subsystem = kHAPPlatform_LogSubsystem, 
 #ifndef HAP_MDNSD_SERVICE_DIR
 #define HAP_MDNSD_SERVICE_DIR "/etc/mdns.d"
 #endif
-#ifndef HAP_MDNSD_RUN_FILE
-#define HAP_MDNSD_RUN_FILE "/run/hap.service"
-#endif
+// The record file is /run/<name>.service, linked from /etc/mdns.d/<name>.service. <name> is "hap" unless
+// RHKD_SERVICE_NAME says otherwise, so a test instance can advertise next to the real one without
+// overwriting its record.
+static char gRunFile[96], gLinkFile[96];
+
+static void InitPaths(void) {
+    if (gRunFile[0])
+        return;
+    const char* name = getenv("RHKD_SERVICE_NAME");
+    if (!name || !*name || strchr(name, '/') || strlen(name) > 32)
+        name = "hap";
+    snprintf(gRunFile, sizeof gRunFile, "/run/%s.service", name);
+    snprintf(gLinkFile, sizeof gLinkFile, HAP_MDNSD_SERVICE_DIR "/%s.service", name);
+}
+#define HAP_MDNSD_RUN_FILE (InitPaths(), gRunFile)
 #ifndef HAP_MDNSD_PIDFILE
 #define HAP_MDNSD_PIDFILE "/var/run/mdnsd.pid"
 #endif
@@ -48,18 +60,19 @@ static void SignalMdnsd(void) {
 }
 
 static void EnsureSymlink(void) {
-    const char* link = HAP_MDNSD_SERVICE_DIR "/hap.service";
+    const char* run = HAP_MDNSD_RUN_FILE;
+    const char* link = gLinkFile;
     char target[256];
     ssize_t n = readlink(link, target, sizeof target - 1);
     if (n > 0) {
         target[n] = '\0';
-        if (strcmp(target, HAP_MDNSD_RUN_FILE) == 0) {
+        if (strcmp(target, run) == 0) {
             return;
         }
     }
     unlink(link);
-    if (symlink(HAP_MDNSD_RUN_FILE, link) != 0) {
-        HAPLogError(&logObject, "symlink %s -> %s failed: %d.", link, HAP_MDNSD_RUN_FILE, errno);
+    if (symlink(run, link) != 0) {
+        HAPLogError(&logObject, "symlink %s -> %s failed: %d.", link, run, errno);
         HAPFatalError();
     }
 }
@@ -78,7 +91,8 @@ static void WriteServiceFile(
         HAPPlatformServiceDiscoveryRef serviceDiscovery,
         HAPPlatformServiceDiscoveryTXTRecord* txtRecords,
         size_t numTXTRecords) {
-    const char* tmp = HAP_MDNSD_RUN_FILE ".tmp";
+    char tmp[112];
+    snprintf(tmp, sizeof tmp, "%s.tmp", HAP_MDNSD_RUN_FILE);
     FILE* f = fopen(tmp, "w");
     if (!f) {
         HAPLogError(&logObject, "open %s failed: %d.", tmp, errno);

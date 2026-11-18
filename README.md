@@ -5,8 +5,8 @@ camera and appears in the Home app as an IP camera. It needs no Homebridge, Scry
 
 It is built on Apple's open-source [HomeKit ADK](https://github.com/apple/HomeKitADK). The camera streaming
 logic is ported from [HAP-NodeJS](https://github.com/homebridge/HAP-NodeJS). Video and audio come straight
-from Thingino's raptor streamer (`rvd`, `rad`) through its shared-memory rings, so nothing is re-encoded on
-the camera.
+from Thingino's raptor streamer (`rvd`, `rad`) through its shared-memory rings, so video is never re-encoded on
+the camera (recording audio is converted from Opus to AAC, as HomeKit Secure Video requires).
 
 ## What works
 
@@ -17,12 +17,17 @@ the camera.
 - **Snapshots** for the Home tile, from raptor's JPEG channel.
 - **Motion sensor,** fed by raptor's motion detection (IVS), with a debounce.
 - **Microphone mute.**
+- **HomeKit Secure Video:** recordings on motion, with a 4 s prebuffer, in the Home timeline (needs an
+  iCloud+ plan and a home hub). Video is raptor's main H.264 stream as is, in fragmented MP4 over the HomeKit
+  Data Stream; audio is the Opus stream converted to AAC-LC (libopus + faac).
+- **Camera settings in Home:** camera on/off, night vision (raptor's IR-cut daemon), status light, snapshot
+  policy (Camera Operating Mode).
 - **Web UI page:**
   - pairing status, setup code and QR;
   - restart, unpair and new code;
   - a codec compatibility check with a one-click fix.
 
-Not yet: two-way audio (talking through the camera speaker) and HomeKit Secure Video recording.
+Not yet: two-way audio (talking through the camera speaker).
 
 Tested on a **Wyze Cam v4** (T41NQ) and a **Wyze Cam v3** (T31X).
 
@@ -44,13 +49,26 @@ In a Thingino firmware build, enable `BR2_PACKAGE_THINGINO_RHKD`.
 Stand-alone, as a static musl mipsel binary:
 
 ```sh
-./deps.sh                       # fetch HomeKitADK, mbedTLS 2.28 and raptor-ipc at pinned commits, apply patches/
+./deps.sh                       # fetch HomeKitADK, mbedTLS 2.28, raptor-ipc, Opus and faac at pinned commits, apply patches/
 make -C build CROSS=mipsel-linux-musl-
-# or in Docker (also works with a remote Docker context):
-docker build -t thingino-hap-build build/ && build/docker-build.sh
 ```
 
 The output is `build/out/rhkd` and `build/out/hap-setupgen` (setup code generator).
+
+**Match the SoC's floating-point ABI.** Thingino builds T31 (XBurst1) code FP32 with legacy NaN, and T41
+(XBurst2) code **FP64 with NAN2008**. A generic FP32 toolchain works on the T31, but on the T41 its
+double-precision code (the AAC encoder) breaks on worker threads. Firmware builds get this right through the
+Thingino toolchain. For stand-alone builds, `build/docker-build.sh` keeps an incremental tree on a (remote)
+Docker host and picks the toolchain per SoC:
+
+```sh
+docker build -t thingino-hap-build build/                                     # T31: musl.cc, FP32
+docker build -t thingino-hap-build-xburst2 -f build/Dockerfile.xburst2 build/ # T41: Thingino xburst2 toolchain, FP64
+build/docker-build.sh                   # -> build/out/
+SOC=xburst2 build/docker-build.sh       # -> build/out-xburst2/
+```
+
+`docker-build.sh` needs `BUILD_HOST=user@docker-host` (SSH access to the machine your docker context points at): the build tree lives there, so only changed sources are sent and object files are kept between builds.
 
 ## Install on a running camera (development)
 

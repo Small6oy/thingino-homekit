@@ -8,14 +8,19 @@
 set -eu
 CAM=${1:?usage: $0 <camera-ip>}
 HERE=$(cd "$(dirname "$0")" && pwd)
-BIN=$HERE/build/out/rhkd
-[ -x "$BIN" ] || { echo "build first: build/docker-build.sh" >&2; exit 1; }
+# The binary must match the camera's SoC FP ABI (T41 = FP64/NAN2008 from SOC=xburst2 builds, T31 = FP32).
+if [ -n "${SSHPASS:-}" ]; then SSH0="sshpass -e ssh"; else SSH0="ssh"; fi
+SOCNAME=$($SSH0 "root@$CAM" 'grep -m1 -o "XBurst@II" /proc/cpuinfo || echo xburst1')
+case "$SOCNAME" in XBurst@II) BIN=$HERE/build/out-xburst2/rhkd; SETUPGEN=$HERE/build/out-xburst2/hap-setupgen ;;
+	*) BIN=$HERE/build/out/rhkd; SETUPGEN=$HERE/build/out/hap-setupgen ;; esac
+echo "Camera CPU: $SOCNAME -> $BIN"
+[ -x "$BIN" ] || { echo "build first: SOC=$( [ "$SOCNAME" = XBurst@II ] && echo xburst2 || echo xburst1 ) build/docker-build.sh" >&2; exit 1; }
 
 if [ -n "${SSHPASS:-}" ]; then SSH="sshpass -e ssh"; else SSH="ssh"; fi
 run() { $SSH "root@$CAM" "$@"; }
 
-echo "Stopping rhkd (init script or test copy)"
-run '[ -x /etc/init.d/S98rhkd ] && /etc/init.d/S98rhkd stop >/dev/null 2>&1; killall rhkd 2>/dev/null; true'
+# rhkd keeps running while files are copied (mv over a running binary is safe); it is stopped and started in
+# one SSH call at the end, so a failed login half way can't leave the camera without HomeKit.
 
 echo "Copying files"
 run 'cat > /usr/bin/rhkd.new && chmod 755 /usr/bin/rhkd.new && mv /usr/bin/rhkd.new /usr/bin/rhkd' <"$BIN"
@@ -23,7 +28,7 @@ run 'cat > /etc/init.d/S98rhkd && chmod 755 /etc/init.d/S98rhkd' <"$HERE/files/e
 run '[ -f /etc/default/rhkd ] || cat > /etc/default/rhkd' <"$HERE/files/etc/default/rhkd"
 
 echo "Setup helper and web UI page"
-run 'cat > /usr/bin/hap-setupgen && chmod 755 /usr/bin/hap-setupgen' <"$HERE/build/out/hap-setupgen"
+run 'cat > /usr/bin/hap-setupgen && chmod 755 /usr/bin/hap-setupgen' <"$SETUPGEN"
 run 'cat > /usr/sbin/rhkd-setup && chmod 755 /usr/sbin/rhkd-setup' <"$HERE/files/usr/sbin/rhkd-setup"
 for f in var/www/config-homekit.html var/www/a/config-homekit.js var/www/a/vendor/qrcode.js \
 	var/www/a/plugins/homekit.webui.json var/www/x/json-homekit.cgi; do
@@ -57,4 +62,5 @@ run 'before=$(rhkd-setup codecs); after=$(rhkd-setup fixcodecs) || echo "  fixco
 echo "  before: $before"; [ "$before" = "$after" ] || echo "  after:  $after"'
 
 echo "Starting"
-run '/etc/init.d/S98rhkd start; sleep 3; pidof rhkd >/dev/null && echo "  rhkd running (pid $(pidof rhkd))"; logread | grep "rhkd\[" | tail -5'
+run '[ -x /etc/init.d/S98rhkd ] && /etc/init.d/S98rhkd stop >/dev/null 2>&1; killall rhkd 2>/dev/null; sleep 1
+/etc/init.d/S98rhkd start; sleep 3; pidof rhkd >/dev/null && echo "  rhkd running (pid $(pidof rhkd))"; logread | grep "rhkd\[" | tail -5'
