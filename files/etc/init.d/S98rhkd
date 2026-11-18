@@ -22,7 +22,15 @@ RHKD_LOG_LEVEL=2
 # Resolved here, not in start(): the supervisor re-runs this script, which resets and re-reads the settings.
 # Empty name = the camera's name (hostname).
 [ -n "$RHKD_NAME" ] || RHKD_NAME=$(hostname)
-[ -n "$RHKD_SERIAL" ] || RHKD_SERIAL=$(tr -d ':' </sys/class/net/wlan0/address 2>/dev/null)
+# Empty serial = a MAC address: wlan0, else eth0, else the first other interface with a real one (wired cameras).
+if [ -z "$RHKD_SERIAL" ]; then
+	for nic in /sys/class/net/wlan0 /sys/class/net/eth0 /sys/class/net/*; do
+		mac=$(cat "$nic/address" 2>/dev/null)
+		case "$mac" in "" | 00:00:00:00:00:00) continue ;; esac
+		RHKD_SERIAL=$(echo "$mac" | tr -d ':')
+		break
+	done
+fi
 
 supervise() {
 	trap 'kill -TERM "$child" 2>/dev/null; wait "$child"; exit 0' TERM INT
@@ -55,10 +63,20 @@ start() {
 	mkdir -p "$RHKD_STORE"
 	chmod 700 "$(dirname "$RHKD_STORE")" "$RHKD_STORE"
 	# First start (fresh flash): create the setup code, and make the codecs HomeKit-compatible once
-	# (Opus audio, an H.264 stream). Later changes to the codecs are left alone.
+	# (Opus audio, an H.264 stream). The codec step is retried on later starts until it succeeds (raptor
+	# may not be ready yet), tracked by its own marker; stores provisioned before keep their codecs as they are.
+	pending=$(dirname "$RHKD_STORE")/.fixcodecs-pending
 	if [ ! -f "$RHKD_STORE/40.10" ] && command -v rhkd-setup >/dev/null; then
-		rhkd-setup provision | logger -t rhkd-setup
-		rhkd-setup fixcodecs | logger -t rhkd-setup
+		rhkd-setup provision 2>&1 | logger -t rhkd-setup
+		[ -f "$RHKD_STORE/40.10" ] && touch "$pending"
+	fi
+	if [ -f "$pending" ] && command -v rhkd-setup >/dev/null; then
+		if out=$(rhkd-setup fixcodecs 2>&1); then
+			rm -f "$pending"
+		else
+			out="$out (will retry on the next start)"
+		fi
+		echo "$out" | logger -t rhkd-setup
 	fi
 	# Own session (setsid), so the supervisor survives the shell or SSH session that ran the script.
 	setsid "$0" supervise </dev/null >/dev/null 2>&1 &

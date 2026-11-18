@@ -2,7 +2,7 @@
 # Cross-build rhkd (HomeKitADK + raptor-ipc) and the ADK AccessorySetupGenerator for
 # Thingino T41 cameras.
 # Dev build: inside the thingino-hap-build image (static musl):  make -C /work/build
-# Firmware build: Buildroot package thingino-rhkd passes CROSS, ARCHFLAGS, EXTRA_CFLAGS and STATIC.
+# Firmware build: Buildroot package thingino-rhkd passes CROSS, ARCHFLAGS, EXTRA_CFLAGS, EXTRA_LDFLAGS and STATIC.
 CROSS ?= mipsel-linux-musl-
 CC := $(CROSS)gcc
 STRIP := $(CROSS)strip
@@ -24,7 +24,8 @@ CFLAGS := $(ARCHFLAGS) $(EXTRA_CFLAGS) -Os -g0 -ffunction-sections -fdata-sectio
   -I$(ADK)/External/HTTP -I$(ADK)/External/JSON -I$(ADK)/External/Base64 \
   -I$(MBED)/include -MMD -MP
 LDSTRIP ?= -s
-LDFLAGS := $(ARCHFLAGS) $(STATIC) -Wl,--gc-sections $(LDSTRIP) -pthread -lm
+EXTRA_LDFLAGS ?=
+LDFLAGS := $(ARCHFLAGS) $(EXTRA_LDFLAGS) $(STATIC) -Wl,--gc-sections $(LDSTRIP) -pthread -lm
 
 ADK_SRCS := $(wildcard $(ADK)/HAP/*.c) $(wildcard $(ADK)/PAL/*.c) \
   $(wildcard $(ADK)/External/HTTP/*.c) $(wildcard $(ADK)/External/JSON/*.c) $(wildcard $(ADK)/External/Base64/*.c) \
