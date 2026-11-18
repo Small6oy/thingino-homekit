@@ -17,9 +17,11 @@
 // {dataType mediaInitialization|mediaFragment, dataSequenceNumber, dataChunkSequenceNumber, isLastDataChunk,
 // dataTotalSize (first chunk)}}], endOfStream (last chunk only)}, chunks of at most 256 KiB.
 //
-// Audio (RecordingAudioActive): raptor's audio ring is Opus (for live view); the reader decodes it and encodes
-// AAC-LC 16 kHz mono (aacpipe.c) into a second queue, and each fragment carries the AAC frames captured during its
-// video span as track 2.
+// Audio (RecordingAudioActive): preferably rad's second output ring "audio2" (rad dual-codec: raw AAC-LC access
+// units, 16 kHz mono, 1024 samples per frame, timestamps on the same capture clock), used as is. Without it (older
+// rad), the reader decodes the Opus ring "audio" (live view's codec) and encodes AAC-LC itself (aacpipe.c). Either
+// way the AAC frames go into a second queue, and each fragment carries those captured during its video span as
+// track 2.
 
 #include "recorder.h"
 
@@ -37,8 +39,10 @@
 
 static const HAPLogObject logObject = { .subsystem = "rhkd", .category = "Recorder" };
 
-#define IDLE_MAX_BYTES   (8u * 1024 * 1024)  // prebuffer cap
-#define STREAM_MAX_BYTES (12u * 1024 * 1024) // backlog cap while streaming (slow link): oldest GOPs are dropped
+// Memory caps. The v4 (T41) has ~60 MB for Linux; with 8/12 MB caps rhkd peaked at 21.6 MB RSS and a second
+// (test) instance got OOM-killed. A 4 s prebuffer of a 3 Mbit/s stream plus one GOP is ~2-2.5 MB.
+#define IDLE_MAX_BYTES   (4u * 1024 * 1024) // prebuffer cap
+#define STREAM_MAX_BYTES (6u * 1024 * 1024) // backlog cap while streaming (slow link): oldest GOPs are dropped
 #define MAX_STREAM_MS    (10u * 60 * 1000)
 #define CHUNK_MAX        0x40000
 
@@ -85,6 +89,39 @@ static size_t aAscLen;          // > 0 once the AAC encoder is running
 // The AAC encoder (created in recorder_set_audio, used by the reader thread). faac is double precision: the
 // binary's FP ABI must match the SoC (T41 = FP64/NAN2008), or it breaks on worker threads (homekit.md).
 static aacpipe_t* gPipe;
+// --- clock alignment -------------------------------------------------------------------------------------------------
+// rad stamps audio from a sample clock that drifts against the video capture clock (seen: audio 6 s ahead after
+// ~1 h on the T31). Both rings are compared with CLOCK_MONOTONIC_RAW: the smallest (now - timestamp) over a
+// window is the ring clock's offset plus its minimum pipeline latency. AAC frames are moved onto the video clock
+// with (audio offset - video offset). A 10 s window follows drift in either direction.
+typedef struct {
+    int64_t off, winMin;
+    int64_t winStart;
+    bool have, winHave;
+} clk_t;
+static clk_t vClk, aClk; // guarded by qLock
+
+static int64_t RawUs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return (int64_t) ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+static void ClkObserve(clk_t* c, int64_t ts) { // qLock held
+    int64_t now = RawUs(), d = now - ts;
+    if (!c->winHave || d < c->winMin) {
+        c->winMin = d;
+        c->winHave = true;
+    }
+    if (!c->have || d < c->off)
+        c->off = d, c->have = true; // fast convergence at start
+    if (now - c->winStart > 10000000) { // close the window: adopt its minimum (follows drift either way)
+        c->off = c->winMin;
+        c->winHave = false;
+        c->winStart = now;
+    }
+}
+
 static uint64_t NowMs(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -159,10 +196,10 @@ static void OnAac(void* ctx HAP_UNUSED, const uint8_t* aac, size_t len, int64_t 
     if (!f)
         return;
     f->next = NULL;
-    f->ts = tsUs;
     f->len = (uint32_t) len;
     memcpy(f->data, aac, len);
     pthread_mutex_lock(&qLock);
+    f->ts = tsUs + (aClk.have && vClk.have ? aClk.off - vClk.off : 0); // onto the video clock
     if (aTail)
         aTail->next = f;
     else
@@ -179,7 +216,58 @@ typedef struct {
     uint32_t max;
     uint64_t seq;
     uint64_t retryAt;
+    bool direct; // reading rad's AAC ring "audio2" (no transcoding)
 } audio_in_t;
+
+// AudioSpecificConfig for AAC (@aot) at @rate Hz, mono. Returns false for a rate AAC can't signal by index.
+static bool MakeAsc(unsigned aot, uint32_t rate, uint8_t out[2]) {
+    static const uint32_t rates[] = { 96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350 };
+    for (unsigned i = 0; i < sizeof rates / sizeof rates[0]; i++)
+        if (rates[i] == rate) {
+            uint16_t v = (uint16_t) ((aot << 11) | (i << 7) | (1 << 3));
+            out[0] = (uint8_t) (v >> 8);
+            out[1] = (uint8_t) v;
+            return true;
+        }
+    return false;
+}
+
+// Opens rad's AAC ring if it's there and matches what HKSV selected (AAC-LC, 1024-sample frames, AUDIO_RATE).
+static bool OpenDirect(audio_in_t* a) {
+    rss_ring_t* ring = rss_ring_open("audio2");
+    if (!ring)
+        return false; // rad without a second codec output
+    rss_stream_info_t info;
+    uint8_t asc[2];
+    bool ok = rss_ring_version_ok(ring, NULL) && rss_ring_get_stream_info(ring, &info) == 0 && info.codec == 97 &&
+              info.profile == 2 && info.width == AACPIPE_FRAME_SAMPLES && info.fps_num == AUDIO_RATE &&
+              MakeAsc(2, info.fps_num, asc);
+    if (!ok) {
+        HAPLogInfo(&logObject, "audio2 ring isn't AAC-LC %u Hz / 1024 (codec %u, aot %u, %u Hz); using the Opus ring",
+                   AUDIO_RATE, (unsigned) info.codec, (unsigned) info.profile, (unsigned) info.fps_num);
+        rss_ring_close(ring);
+        return false;
+    }
+    a->ring = ring;
+    a->direct = true;
+    a->max = rss_ring_max_frame_size(ring);
+    a->buf = malloc(a->max);
+    if (!a->buf) {
+        rss_ring_close(ring);
+        a->ring = NULL;
+        a->direct = false;
+        return false;
+    }
+    rss_ring_acquire(ring);
+    a->seq = atomic_load(&rss_ring_get_header(ring)->write_seq) + 1;
+    pthread_mutex_lock(&qLock);
+    memcpy(aAsc, asc, 2);
+    aAscLen = 2;
+    pthread_mutex_unlock(&qLock);
+    HAPLogInfo(&logObject, "recording audio: rad AAC ring audio2 (AAC-LC %u Hz mono, no transcoding), ASC %02X%02X",
+               AUDIO_RATE, asc[0], asc[1]);
+    return true;
+}
 
 static void AudioClose(audio_in_t* a) {
     if (a->ring) {
@@ -205,6 +293,8 @@ static void AudioPump(audio_in_t* a) {
         if (NowMs() < a->retryAt)
             return;
         a->retryAt = NowMs() + 5000;
+        if (OpenDirect(a))
+            goto read;
         a->ring = rss_ring_open("audio");
         if (!a->ring || !rss_ring_version_ok(a->ring, NULL) || rss_ring_get_header(a->ring)->codec != 111) {
             if (a->ring) {
@@ -234,6 +324,7 @@ static void AudioPump(audio_in_t* a) {
         HAPLogInfo(&logObject, "recording audio: Opus ring -> AAC-LC %u Hz mono, ASC %02X%02X", AUDIO_RATE,
                    n > 0 ? asc[0] : 0, n > 1 ? asc[1] : 0);
     }
+read:
     for (;;) {
         uint32_t len = 0;
         rss_ring_slot_t meta;
@@ -244,7 +335,12 @@ static void AudioPump(audio_in_t* a) {
         }
         if (ret)
             break;
-        if (aacpipe_decode(a->pipe, a->buf, len, meta.timestamp) >= AACPIPE_FRAME_SAMPLES)
+        pthread_mutex_lock(&qLock);
+        ClkObserve(&aClk, meta.timestamp);
+        pthread_mutex_unlock(&qLock);
+        if (a->direct)
+            OnAac(NULL, a->buf, len, meta.timestamp); // one raw AAC-LC access unit per slot
+        else if (aacpipe_decode(a->pipe, a->buf, len, meta.timestamp) >= AACPIPE_FRAME_SAMPLES)
             (void) aacpipe_encode(a->pipe, OnAac, NULL);
     }
     if (rss_ring_stale(a->ring))
@@ -305,6 +401,7 @@ static void* Reader(void* arg HAP_UNUSED) {
             f->len = len;
             memcpy(f->data, buf, len);
             pthread_mutex_lock(&qLock);
+            ClkObserve(&vClk, meta.timestamp);
             Push(f);
             if (!qStreaming)
                 TrimPrebuffer();
@@ -555,6 +652,11 @@ static void* Sender(void* arg HAP_UNUSED) {
             memcpy(asc, aAsc, ascLen);
             pthread_mutex_unlock(&qLock);
             ao = (audio_out_t) { .on = ascLen > 0 };
+            pthread_mutex_lock(&qLock);
+            HAPLogInfo(&logObject, "clocks: video head %lld us, audio queue %lld..%lld us (aligned; audio-video offset %lld ms)",
+                       (long long) k->ts, aHead ? (long long) aHead->ts : -1LL, aTail ? (long long) aTail->ts : -1LL,
+                       aClk.have && vClk.have ? (long long) ((aClk.off - vClk.off) / 1000) : 0LL);
+            pthread_mutex_unlock(&qLock);
             fmp4_buf_t o = { 0 };
             bool ok = fmp4_init_segment(&o, w, h, sps, spsLen, pps, ppsLen, ascLen ? asc : NULL, ascLen, AUDIO_RATE) &&
                       SendPacket(&s, "mediaInitialization", o.b, o.len);
@@ -616,12 +718,12 @@ void recorder_set_active(bool on, uint32_t prebufferMs, uint32_t fragmentMs) {
 
 void recorder_set_audio(bool on, uint32_t bitrate) {
     atomic_store(&r.audioBitrate, bitrate);
-    if (on && !gPipe) {
+    if (on && !gPipe) { // only needed without rad's AAC ring, but cheap to have ready
         gPipe = aacpipe_open(AUDIO_RATE, bitrate < 24000 ? 24000 : bitrate);
         if (!gPipe)
-            HAPLogError(&logObject, "could not create the AAC encoder; recordings stay silent");
+            HAPLogError(&logObject, "could not create the AAC encoder; audio needs rad's audio2 ring");
     }
-    atomic_store(&r.audioOn, on && gPipe);
+    atomic_store(&r.audioOn, on);
     // The pipe is kept once created (tiny), so the reader never sees it disappear.
 }
 
