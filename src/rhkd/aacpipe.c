@@ -6,7 +6,8 @@
 // SOC=xburst2 builds); an FP32 build broke on T41 worker threads (homekit.md "faac off the main thread").
 //
 // faac versions: the bundled faac 1.30 (legacy faacEnc* API) or faac >= 2 (faac_encoder_* API, as Thingino's faac
-// package ships it), picked by FAAC_VERSION_MAJOR, which only faac >= 2's header defines.
+// package ships it), picked by FAAC_VERSION_MAJOR, which only faac >= 2's header defines. faac 3.0 (ABI 3) renamed
+// the faac_params fields and made bit_rate whole-stream; for mono the value is the same.
 //
 // Timing: the first PCM sample takes the packet's capture time; after that samples are counted, so AAC frames are
 // exactly 1024 samples apart. faac's priming delay (1024 samples in both versions: output k starts at input sample
@@ -27,6 +28,11 @@
 #define FAAC_V2 1
 #else
 #define FAAC_V2 0
+#endif
+#if defined(FAAC_VERSION_MAJOR) && FAAC_VERSION_MAJOR >= 3
+#define AACPIPE_OBJ_LC FAAC_OBJ_LC
+#else
+#define AACPIPE_OBJ_LC FAAC_OBJ_LOW
 #endif
 
 #define MAX_OPUS_SAMPLES 5760 // 120 ms at 48 kHz: the largest Opus packet, at any decode rate
@@ -63,21 +69,30 @@ static bool OpenEncoder(aacpipe_t* p, uint32_t sampleRate, uint32_t bitrate) {
     if (faac_params_init(&prm, sizeof prm) != FAAC_OK)
         return false;
     prm.sample_rate = sampleRate;
+    prm.bandwidth = 0;
+    prm.input_format = FAAC_INPUT_16BIT;
+#if FAAC_VERSION_MAJOR >= 3
+    prm.channels = 1;
+    prm.object_type = FAAC_OBJ_LC;
+    prm.stereo_mode = FAAC_STEREO_LR;
+    prm.flags = FAAC_FLAG_PNS; // TNS off, PNS on, as before
+    prm.bit_rate = bitrate;    // whole-stream; mono
+    prm.stream_format = FAAC_STREAM_RAW;
+#else
     prm.num_channels = 1;
     prm.mpeg_version = FAAC_MPEG4;
     prm.object_type = FAAC_OBJ_LOW;
     prm.joint_mode = FAAC_JOINT_NONE;
     prm.use_tns = false;
     prm.bit_rate = bitrate; // per channel; mono
-    prm.bandwidth = 0;
     prm.output_format = FAAC_STREAM_RAW;
-    prm.input_format = FAAC_INPUT_16BIT;
+#endif
     if (faac_encoder_open(&prm, &p->enc) != FAAC_OK)
         return false;
     faac_encoder_info info = { .struct_size = sizeof info };
     uint32_t ascLen = 0;
     if (faac_encoder_get_info(p->enc, &info) != FAAC_OK || info.frame_samples != AACPIPE_FRAME_SAMPLES ||
-        info.object_type != FAAC_OBJ_LOW || faac_encoder_asc(p->enc, &p->asc, &ascLen) != FAAC_OK)
+        info.object_type != AACPIPE_OBJ_LC || faac_encoder_asc(p->enc, &p->asc, &ascLen) != FAAC_OK)
         return false;
     p->maxOut = info.max_output_bytes;
     p->delay = info.encoder_delay;
