@@ -40,6 +40,13 @@ stream_t* stream_start(const stream_params_t* p);
 void stream_stop(stream_t* s);           // joins the thread and closes sockets
 bool stream_finished(const stream_t* s); // true if the thread ended on its own (timeout/error)
 void stream_request_idr(stream_t* s);
+void stream_set_paused(stream_t* s, bool paused); // Suspend/Resume: no media while paused, IDR on resume
 void stream_set_audio_muted(stream_t* s, bool muted); // muted: audio packets are not sent
 int stream_ring_codec(const char* ringName);          // rss codec of a ring (0 = H.264, 111 = Opus), -1 if unavailable
+typedef struct {
+    uint32_t streamId; // rvd channel for video rings
+    uint32_t codec;
+    uint32_t width, height;
+} stream_ring_info_t;
+bool stream_ring_info(const char* ringName, stream_ring_info_t* info); // false if the ring is absent
 #endif

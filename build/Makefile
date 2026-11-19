@@ -36,30 +36,38 @@ MBED_SRCS := $(wildcard $(MBED)/library/*.c)
 GEN_SRCS := $(ADK)/Tools/AccessorySetupGenerator/Main.c
 RHKD_SRCS := $(wildcard $(SRC)/rhkd/*.c)
 RIPC_SRCS := $(SRC)/raptor-ipc/src/rss_ring.c $(SRC)/raptor-ipc/src/rss_ipc_log.c $(SRC)/raptor-ipc/src/rss_ctrl.c
-# HKSV audio fallback (TRANSCODE=1): decode an Opus rad ring (libopus, fixed point) and encode AAC-LC (faac), for a
-# rad without an AAC-LC 16 kHz output. TRANSCODE=0 drops aacpipe.c, libopus and faac: recordings then need one of
-# rad's AAC rings ("audio3"/"audio"/"audio2"), which stock Thingino audio provides. Camera dev builds use 0
-# (docker-build.sh); the default stays 1 until rhkd-setup configures rad's outputs itself (todo.md).
-# SYSTEM_AUDIO=1 (with TRANSCODE=1) links the system libopus and libfaac (faac >= 2 API, as Thingino's packages
-# ship them) instead of building the bundled copies; AUDIO_CFLAGS points at their headers (opus.h is in include/opus).
+# Audio libraries. libopus is always linked: two-way audio decodes the controller's Opus (talkback.c).
+# HKSV audio fallback (TRANSCODE=1): decode an Opus rad ring and encode AAC-LC (faac), for a rad without an AAC-LC
+# 16 kHz output. TRANSCODE=0 drops aacpipe.c and faac: recordings then need one of rad's AAC rings
+# ("audio3"/"audio"/"audio2"), which stock Thingino audio provides. Camera dev builds use 0 (docker-build.sh); the
+# default stays 1 until rhkd-setup configures rad's outputs itself (todo.md).
+# SYSTEM_AUDIO=1 links the system libopus (and libfaac, faac >= 2 API, as Thingino's packages ship them) instead of
+# building the bundled copies; AUDIO_CFLAGS points at their headers (opus.h is in include/opus).
 TRANSCODE ?= 1
 SYSTEM_AUDIO ?= 0
 AUDIO_CFLAGS ?=
 AUDIO_LIBS :=
 AUDIO_LDLIBS :=
-ifeq ($(TRANSCODE)$(SYSTEM_AUDIO),11)
-AUDIO_LDLIBS := -lopus -lfaac
-else ifeq ($(TRANSCODE),1)
-AUDIO_LIBS := $(OUT)/libopus.a $(OUT)/libfaac.a
-AUDIO_CFLAGS += -I$(SRC)/opus/include -I$(SRC)/faac/include
+ifeq ($(SYSTEM_AUDIO),1)
+AUDIO_LDLIBS := -lopus
+ifeq ($(TRANSCODE),1)
+AUDIO_LDLIBS += -lfaac
+endif
+else
+AUDIO_LIBS := $(OUT)/libopus.a
+AUDIO_CFLAGS += -I$(SRC)/opus/include
 OPUS := $(SRC)/opus
 include $(OPUS)/celt_sources.mk
 include $(OPUS)/silk_sources.mk
 include $(OPUS)/opus_sources.mk
 OPUS_SRCS := $(addprefix $(OPUS)/,$(CELT_SOURCES) $(SILK_SOURCES) $(SILK_SOURCES_FIXED) $(OPUS_SOURCES))
+ifeq ($(TRANSCODE),1)
+AUDIO_LIBS += $(OUT)/libfaac.a
+AUDIO_CFLAGS += -I$(SRC)/faac/include
 FAAC := $(SRC)/faac
 FAAC_SRCS := $(addprefix $(FAAC)/libfaac/,bitstream.c fft.c frame.c blockswitch.c util.c channels.c filtbank.c \
   tns.c quantize.c huff2.c huffdata.c stereo.c)
+endif
 endif
 ifneq ($(TRANSCODE),1)
 RHKD_SRCS := $(filter-out %/aacpipe.c,$(RHKD_SRCS))
@@ -97,6 +105,8 @@ $(call obj,$(RHKD_SRCS)): CFLAGS += $(AUDIO_CFLAGS)
 ifneq ($(OPUS_SRCS),)
 $(call obj,$(OPUS_SRCS)): CFLAGS += -DOPUS_BUILD -DFIXED_POINT -DVAR_ARRAYS -DHAVE_LRINT -DHAVE_LRINTF \
   -I$(OPUS)/include -I$(OPUS)/celt -I$(OPUS)/silk -I$(OPUS)/silk/fixed -I$(OPUS) -w
+endif
+ifneq ($(FAAC_SRCS),)
 $(call obj,$(FAAC_SRCS)): CFLAGS += -I$(FAAC)/include -I$(FAAC)/libfaac -DPACKAGE_VERSION=\"1.30\" -w
 endif
 

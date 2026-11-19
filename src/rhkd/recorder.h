@@ -10,7 +10,9 @@
 #include "hds.h"
 
 // Recording Active on/off (HAP run loop). On starts the prebuffer thread; off stops it (and any stream).
-void recorder_set_active(bool on, uint32_t prebufferMs, uint32_t fragmentMs);
+// @iframeMs: the I-frame interval Home selected (0 = none); the recording ring is never changed (it is shared),
+// but fragments longer than this are logged once per recording.
+void recorder_set_active(bool on, uint32_t prebufferMs, uint32_t fragmentMs, uint32_t iframeMs);
 
 // RecordingAudioActive: include AAC-LC audio (from the Opus ring) at @bitrate bit/s.
 void recorder_set_audio(bool on, uint32_t bitrate);

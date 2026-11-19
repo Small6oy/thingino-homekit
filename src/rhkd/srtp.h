@@ -1,4 +1,4 @@
-// SRTP/SRTCP AES_CM_128_HMAC_SHA1_80 (RFC 3711), sender side only.
+// SRTP/SRTCP AES_CM_128_HMAC_SHA1_80 (RFC 3711): sending, plus receiving RTCP and RTP (two-way audio).
 // SPDX-License-Identifier: Apache-2.0
 #ifndef RHKD_SRTP_H
 #define RHKD_SRTP_H
@@ -23,6 +23,10 @@ typedef struct {
     uint16_t lastSeq;
     int haveSeq;
     uint32_t srtcpIndex;
+    // Receiving RTP (the controller's stream; same keys, its own SSRC and sequence numbers).
+    uint32_t rxRoc;
+    uint16_t rxLastSeq;
+    int rxHaveSeq;
 } srtp_ctx_t;
 
 int srtp_init(srtp_ctx_t* c, const uint8_t masterKey[16], const uint8_t masterSalt[14]);
@@ -33,4 +37,7 @@ size_t srtp_protect_rtp(srtp_ctx_t* c, uint8_t* buf, size_t len);
 size_t srtp_protect_rtcp(srtp_ctx_t* c, uint8_t* buf, size_t len);
 // Verifies and decrypts an incoming SRTCP packet in place. Returns the plain RTCP length, or 0 if invalid.
 size_t srtp_unprotect_rtcp(srtp_ctx_t* c, uint8_t* buf, size_t len);
+// Verifies and decrypts an incoming SRTP packet in place (one sender per context). Returns the plain RTP length
+// (header + payload), or 0 if it is invalid or fails authentication.
+size_t srtp_unprotect_rtp(srtp_ctx_t* c, uint8_t* buf, size_t len);
 #endif

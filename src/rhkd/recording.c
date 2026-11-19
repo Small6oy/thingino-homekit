@@ -68,7 +68,7 @@ static struct {
     uint8_t active, audioActive;
     uint8_t selected[256];
     size_t selectedLen;
-    uint32_t prebufferMs, fragmentMs, audioKbps; // from the selected configuration
+    uint32_t prebufferMs, fragmentMs, iframeMs, audioKbps; // from the selected configuration
 } rec = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -155,6 +155,7 @@ static void LogSelected(const uint8_t* t, size_t len) {
     }
     rec.prebufferMs = prebuffer;
     rec.fragmentMs = fragment;
+    rec.iframeMs = iframe;
     rec.audioKbps = abr;
     HAPLogInfo(&logObject,
                "Selected recording: prebuffer %u ms, triggers 0x%x, fragment %u ms; video %ux%u@%u profile %u level %u "
@@ -337,7 +338,7 @@ static HAPError HandleActiveWrite(
     pthread_mutex_lock(&rec.lock);
     rec.active = value;
     pthread_mutex_unlock(&rec.lock);
-    recorder_set_active(value, rec.prebufferMs, rec.fragmentMs);
+    recorder_set_active(value, rec.prebufferMs, rec.fragmentMs, rec.iframeMs);
     Save();
     HAPAccessoryServerRaiseEvent(rec.server, request->characteristic, request->service, request->accessory);
     return kHAPError_None;
@@ -378,7 +379,7 @@ void recording_init(HAPAccessoryServerRef* server, HAPPlatformKeyValueStoreRef k
         LogSelected(rec.selected, rec.selectedLen);
     recorder_set_audio(rec.audioActive, rec.audioKbps * 1000);
     if (rec.active)
-        recorder_set_active(true, rec.prebufferMs, rec.fragmentMs);
+        recorder_set_active(true, rec.prebufferMs, rec.fragmentMs, rec.iframeMs);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

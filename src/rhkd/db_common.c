@@ -38,7 +38,7 @@
 #define kIID_PairingPairingPairings ((uint64_t) 0x0025)
 
 
-HAP_STATIC_ASSERT(kAttributeCount == 9 + 3 + 5 + 8 + 2 + 3, AttributeCount_mismatch); // camera service = 1 + 7
+HAP_STATIC_ASSERT(kAttributeCount == 9 + 3 + 5 + 8 + 8 + 2 + 3 + 4 + 5 + 7 + 4 + 7, AttributeCount_mismatch); // service + its characteristics
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 

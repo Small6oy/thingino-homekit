@@ -46,6 +46,7 @@ typedef struct aacpipe aacpipe_t;
 #define AACPIPE_FRAME_SAMPLES 1024
 #endif
 #include "rss_ipc.h"
+#include "ringutil.h"
 
 static const HAPLogObject logObject = { .subsystem = "rhkd", .category = "Recorder" };
 
@@ -55,6 +56,11 @@ static const HAPLogObject logObject = { .subsystem = "rhkd", .category = "Record
 #define STREAM_MAX_BYTES (6u * 1024 * 1024) // backlog cap while streaming (slow link): oldest GOPs are dropped
 #define MAX_STREAM_MS    (10u * 60 * 1000)
 #define CHUNK_MAX        0x40000
+// HDS back-pressure: before each chunk, wait until at most this much is unacknowledged by the controller
+// (RHKD_HDS_MAX_UNACKED_KB, 0 = off). One chunk (256 KB) can then be in flight on top of it, so the kernel holds
+// well under a second of recording instead of its full autotuned send buffer (up to MBs) ahead of live RTP.
+#define HDS_MAX_UNACKED_KB   256
+#define HDS_UNACKED_WAIT_MS  10000
 
 typedef struct frame {
     struct frame* next;
@@ -69,7 +75,7 @@ static struct {
     pthread_t reader, sender;
     bool running;
     atomic_bool stop;
-    uint32_t prebufferMs, fragmentMs;
+    uint32_t prebufferMs, fragmentMs, iframeMs;
     hds_conn_t* conn;
     int64_t streamId;
     bool streamNew;
@@ -102,14 +108,28 @@ static size_t aAscLen;          // > 0 once the AAC encoder is running
 static aacpipe_t* gPipe;
 #endif
 // --- clock alignment -------------------------------------------------------------------------------------------------
-// rad stamps audio from a sample clock that drifts against the video capture clock (seen: audio 6 s ahead after
-// ~1 h on the T31). Both rings are compared with CLOCK_MONOTONIC_RAW: the smallest (now - timestamp) over a
-// window is the ring clock's offset plus its minimum pipeline latency. AAC frames are moved onto the video clock
-// with (audio offset - video offset). A 10 s window follows drift in either direction.
+// The rings use different clocks: video is CLOCK_MONOTONIC_RAW minus a constant from rvd's IMP_System_Init, audio
+// is CLOCK_MONOTONIC, and the two drift apart as NTP slews MONOTONIC (v4 +55 ppm, v3 +6 ppm, measured with a clock
+// probe). Each ring's offset to one reference clock (MONOTONIC_RAW here) is estimated separately, and AAC frames
+// are moved onto the video clock with (audio offset - video offset).
+//
+// Estimator ported from raptor-common's rss_media_clock.c (GPL-3.0-or-later, used by rsd and rwd): now - ts is
+// the clock offset plus a non-negative delivery delay, so the offset is taken from the low end of it: one minimum
+// per second over 16 s, and the MEDIAN of those minima (an occasional faster frame, e.g. one that skipped waiting
+// for the main stream, doesn't pull it down and cause a ~25 ms sawtooth). The offset follows that target with a
+// filtered proportional slew of at most 1 ms per frame. rhkd additions: the clock restarts when its ring is
+// reopened (MClkReset), and a target more than 500 ms away is taken at once (a producer restart).
+#define MCLK_BUCKETS   16
+#define MCLK_BUCKET_US 1000000
+#define MCLK_SLEW_MAX  1000
+#define MCLK_SNAP_US   500000
 typedef struct {
-    int64_t off, winMin;
-    int64_t winStart;
-    bool have, winHave;
+    int64_t bucketMin[MCLK_BUCKETS];
+    int64_t bucketStart;
+    int64_t off;
+    int64_t errEwma;
+    uint8_t bucket;
+    bool have;
 } clk_t;
 static clk_t vClk, aClk; // guarded by qLock
 
@@ -119,19 +139,67 @@ static int64_t RawUs(void) {
     return (int64_t) ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
+static void MClkClear(clk_t* c) {
+    for (int i = 0; i < MCLK_BUCKETS; i++)
+        c->bucketMin[i] = INT64_MAX;
+    c->bucket = 0;
+}
+
+static void MClkReset(clk_t* c) { // qLock held
+    MClkClear(c);
+    c->bucketStart = c->off = c->errEwma = 0;
+    c->have = false;
+}
+
 static void ClkObserve(clk_t* c, int64_t ts) { // qLock held
-    int64_t now = RawUs(), d = now - ts;
-    if (!c->winHave || d < c->winMin) {
-        c->winMin = d;
-        c->winHave = true;
+    int64_t now = RawUs(), sample = now - ts;
+    if (!c->have) {
+        MClkClear(c);
+        c->bucketStart = now;
+        c->bucketMin[0] = c->off = sample;
+        c->errEwma = 0;
+        c->have = true;
+        return;
     }
-    if (!c->have || d < c->off)
-        c->off = d, c->have = true; // fast convergence at start
-    if (now - c->winStart > 10000000) { // close the window: adopt its minimum (follows drift either way)
-        c->off = c->winMin;
-        c->winHave = false;
-        c->winStart = now;
+    int64_t elapsed = now - c->bucketStart;
+    if (elapsed < 0 || elapsed >= (int64_t) MCLK_BUCKET_US * MCLK_BUCKETS) { // stalled a whole window: start over
+        MClkClear(c);
+        c->bucketStart = now;
+    } else {
+        while (elapsed >= MCLK_BUCKET_US) {
+            c->bucket = (uint8_t) ((c->bucket + 1) % MCLK_BUCKETS);
+            c->bucketMin[c->bucket] = INT64_MAX;
+            c->bucketStart += MCLK_BUCKET_US;
+            elapsed -= MCLK_BUCKET_US;
+        }
     }
+    if (sample < c->bucketMin[c->bucket])
+        c->bucketMin[c->bucket] = sample;
+
+    int64_t sorted[MCLK_BUCKETS]; // median of the populated per-second minima (insertion sort, at most 16)
+    int n = 0;
+    for (int i = 0; i < MCLK_BUCKETS; i++) {
+        int64_t v = c->bucketMin[i];
+        if (v == INT64_MAX)
+            continue;
+        int j = n++;
+        while (j > 0 && sorted[j - 1] > v) {
+            sorted[j] = sorted[j - 1];
+            j--;
+        }
+        sorted[j] = v;
+    }
+    if (!n)
+        return;
+    int64_t target = sorted[n / 2], err = target - c->off;
+    if (err > MCLK_SNAP_US || err < -MCLK_SNAP_US) {
+        c->off = target;
+        c->errEwma = 0;
+        return;
+    }
+    c->errEwma += (err - c->errEwma) / 16;
+    int64_t slew = c->errEwma / 16;
+    c->off += slew > MCLK_SLEW_MAX ? MCLK_SLEW_MAX : slew < -MCLK_SLEW_MAX ? -MCLK_SLEW_MAX : slew;
 }
 
 static uint64_t NowMs(void) {
@@ -311,6 +379,7 @@ static void AudioClose(audio_in_t* a) {
     pthread_mutex_lock(&qLock);
     aAscLen = 0;
     AClear();
+    MClkReset(&aClk); // a reopened ring (e.g. rad restarted) may use another clock base
     pthread_mutex_unlock(&qLock);
 }
 
@@ -401,6 +470,7 @@ static void* Reader(void* arg HAP_UNUSED) {
     uint8_t* buf = NULL;
     uint32_t maxFrame = 0, overflows = 0;
     uint64_t readSeq = 0;
+    uint32_t ringInc = 0;
     audio_in_t audio = { 0 };
 
     while (!atomic_load(&r.stop)) {
@@ -420,10 +490,14 @@ static void* Reader(void* arg HAP_UNUSED) {
             free(buf);
             buf = malloc(maxFrame);
             rss_ring_acquire(ring);
+            pthread_mutex_lock(&qLock);
+            MClkReset(&vClk); // rvd restarted: its IMP clock base may have changed
+            pthread_mutex_unlock(&qLock);
             const rss_ring_header_t* h = rss_ring_get_header(ring);
             atomic_store(&r.width, h->width);
             atomic_store(&r.height, h->height);
             readSeq = atomic_load(&h->write_seq) + 1;
+            ringInc = ring_incarnation(ring);
             HAPLogInfo(&logObject, "prebuffering %s (%ux%u), %u ms", ringName, h->width, h->height, r.prebufferMs);
         }
         (void) rss_ring_wait(ring, 100);
@@ -432,6 +506,8 @@ static void* Reader(void* arg HAP_UNUSED) {
             rss_ring_slot_t meta;
             int ret = buf ? rss_ring_read(ring, &readSeq, buf, maxFrame, &len, &meta) : -1;
             if (ret == RSS_EOVERFLOW) {
+                if (ring_recreated(ring, ringInc))
+                    break; // reopened below
                 readSeq = atomic_load(&rss_ring_get_header(ring)->write_seq);
                 if (++overflows <= 5 || overflows % 100 == 0)
                     HAPLogError(&logObject, "recorder fell behind the ring: frames lost (%u times)", overflows);
@@ -453,7 +529,7 @@ static void* Reader(void* arg HAP_UNUSED) {
                 TrimPrebuffer();
             pthread_mutex_unlock(&qLock);
         }
-        if (rss_ring_stale(ring)) {
+        if (ring_recreated(ring, ringInc)) {
             HAPLogInfo(&logObject, "ring %s restarted; reopening", ringName);
             rss_ring_release(ring);
             rss_ring_close(ring);
@@ -478,7 +554,18 @@ typedef struct {
     uint32_t dataSeq;
     bool failed;
     uint8_t* msg;
+    size_t maxUnacked; // 0: no back-pressure
+    unsigned waitedMs; // time spent waiting for acknowledgements this stream
+    bool gopWarned;    // logged that keyframes are further apart than Home asked
 } sender_t;
+
+static size_t MaxUnacked(void) {
+    const char* v = getenv("RHKD_HDS_MAX_UNACKED_KB");
+    if (!v || !*v)
+        return HDS_MAX_UNACKED_KB * 1024;
+    int n = atoi(v);
+    return n > 0 ? (size_t) n * 1024 : 0;
+}
 
 static bool SendPacket(sender_t* s, const char* dataType, const uint8_t* data, size_t len) {
     uint32_t chunkSeq = 1;
@@ -486,6 +573,10 @@ static bool SendPacket(sender_t* s, const char* dataType, const uint8_t* data, s
     do {
         size_t n = len - off < CHUNK_MAX ? len - off : CHUNK_MAX;
         bool last = off + n >= len;
+        if (s->maxUnacked && hds_wait_unacked(s->conn, s->maxUnacked, HDS_UNACKED_WAIT_MS, &s->waitedMs)) {
+            s->failed = true;
+            return false;
+        }
         op_writer_t w;
         op_w_init(&w, s->msg, CHUNK_MAX + 512);
         op_w_dict(&w, last ? 3 : 2);
@@ -573,6 +664,27 @@ static bool EmitFragments(sender_t* s, uint32_t* fragSeq, int64_t* t0, uint32_t*
         }
         if (*t0 < 0)
             *t0 = head->ts;
+        // The certified G100 sets its encoder's GOP from the I-frame interval Home selects (4000 ms in practice).
+        // Our recording ring is shared, so we only report a GOP longer than that: fragments then run past the
+        // length Home asked for, and the prebuffer starts earlier than it expects.
+        if (!s->gopWarned && r.iframeMs) {
+            int64_t lastKey = head->ts, maxGap = 0;
+            for (frame_t* f = head->next; f; f = f->next) { // up to and including the next fragment's keyframe
+                if (f->key) {
+                    if (f->ts - lastKey > maxGap)
+                        maxGap = f->ts - lastKey;
+                    lastKey = f->ts;
+                }
+                if (f == end)
+                    break;
+            }
+            if (maxGap / 1000 > (int64_t) r.iframeMs + 250) {
+                s->gopWarned = true;
+                HAPLogInfo(&logObject, "fragment %u: keyframes %lld ms apart, Home selected an I-frame interval of "
+                           "%u ms (lower the recording stream's gop in raptor.conf)",
+                           *fragSeq, (long long) (maxGap / 1000), r.iframeMs);
+            }
+        }
         uint64_t base = (uint64_t) (head->ts - *t0) * FMP4_TIMESCALE / 1000000;
 
         // Audio captured before this fragment's end (older leftovers before its start are dropped).
@@ -631,7 +743,7 @@ static bool EmitFragments(sender_t* s, uint32_t* fragSeq, int64_t* t0, uint32_t*
 }
 
 static void* Sender(void* arg HAP_UNUSED) {
-    sender_t s = { .msg = malloc(CHUNK_MAX + 512) };
+    sender_t s = { .msg = malloc(CHUNK_MAX + 512), .maxUnacked = MaxUnacked() };
     bool streaming = false, sentInit = false;
     uint32_t fragSeq = 1, frames = 0, dropped = 0;
     int64_t t0 = -1;
@@ -654,6 +766,8 @@ static void* Sender(void* arg HAP_UNUSED) {
             sentInit = false;
             s.dataSeq = 1;
             s.failed = false;
+            s.waitedMs = 0;
+            s.gopWarned = false;
             fragSeq = 1;
             frames = dropped = 0;
             t0 = -1;
@@ -664,9 +778,10 @@ static void* Sender(void* arg HAP_UNUSED) {
             pthread_mutex_unlock(&qLock);
             HAPLogInfo(&logObject, "recording stream %lld: %u ms queued", (long long) s.streamId, queued);
         } else if (streaming && conn != s.conn) {
-            HAPLogInfo(&logObject, "recording stream %lld ended: %u fragments, %u frames, %u dropped, %u AAC frames, %u s",
+            HAPLogInfo(&logObject, "recording stream %lld ended: %u fragments, %u frames, %u dropped, %u AAC frames, %u s, "
+                       "%u ms waiting for acks",
                        (long long) s.streamId, fragSeq - 1, frames, dropped, ao.frames,
-                       (unsigned) ((NowMs() - streamStart) / 1000));
+                       (unsigned) ((NowMs() - streamStart) / 1000), s.waitedMs);
             streaming = false;
             pthread_mutex_lock(&qLock);
             qStreaming = false;
@@ -729,7 +844,8 @@ static void* Sender(void* arg HAP_UNUSED) {
 // ---------------------------------------------------------------------------------------------------------------------
 // API
 
-void recorder_set_active(bool on, uint32_t prebufferMs, uint32_t fragmentMs) {
+void recorder_set_active(bool on, uint32_t prebufferMs, uint32_t fragmentMs, uint32_t iframeMs) {
+    r.iframeMs = iframeMs;
     r.prebufferMs = prebufferMs ? prebufferMs : 4000;
     r.fragmentMs = fragmentMs ? fragmentMs : 4000;
     if (on && !r.running) {

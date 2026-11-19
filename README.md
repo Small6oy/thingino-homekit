@@ -10,21 +10,27 @@ the camera. Recording audio is AAC-LC from one of rad's AAC outputs, or, if rad 
 on the camera.
 
 **Architecture:** an interactive diagram of how rhkd connects Apple Home to raptor's rings and daemons is at
-<https://small6oy.github.io/thingino-homekit/> (it shows the development line, ahead of this release).
+<https://small6oy.github.io/thingino-homekit/>.
 
 ## What works
 
 - **Pairing:** with the setup code or QR code from the camera's web UI (**Services → HomeKit**). Pairings are
   stored on flash.
-- **Live view:** H.264 video and Opus audio over SRTP. While Home is viewing, the substream's bitrate follows
-  what iOS asks for, and the configured value is restored afterwards.
+- **Live view:** H.264 video and Opus audio over SRTP, for **two viewers** at once. With an on-demand `aux`
+  video stream in raptor (`[stream2]`), each viewer gets a stream sized and bitrate-matched to what iOS asks for;
+  without it, rhkd picks `main` or `sub` as before. While Home is viewing, the bitrate of `sub` or `aux` follows
+  iOS and the configured value is restored afterwards. Pause and resume from iOS are handled.
+- **Two-way audio:** the talk button in Home plays through the camera speaker (Opus from iOS, decoded to PCM for
+  rad's `speaker` ring). An **Echo Cancellation** switch in Home turns rad's echo canceller on while talking.
 - **Snapshots** for the Home tile, from raptor's JPEG channel.
 - **Motion sensor,** fed by raptor's motion detection (IVS), with a debounce.
 - **Microphone mute.**
 - **HomeKit Secure Video:** recordings on motion, with a 4 s prebuffer, in the Home timeline (needs an
   iCloud+ plan and a home hub). Video is raptor's main H.264 stream as is, in fragmented MP4 over the HomeKit
   Data Stream. Audio is AAC-LC 16 kHz: taken as is from a rad output that carries it (`audio3`, `audio` or
-  `audio2`, picked by codec), otherwise rad's Opus stream converted on the camera (libopus + faac).
+  `audio2`, picked by codec), otherwise rad's Opus stream converted on the camera (libopus + faac). Audio is
+  aligned to the video clock with raptor's media clock estimator, and recording data is paced by what the hub has
+  acknowledged, so a weak uplink isn't flooded.
 - **Camera settings in Home:** camera on/off, night vision (raptor's IR-cut daemon), status light, snapshot
   policy (Camera Operating Mode).
 - **Web UI page:**
@@ -32,13 +38,13 @@ on the camera.
   - restart, unpair and new code;
   - a codec compatibility check with a one-click fix.
 
-Not yet: two-way audio (talking through the camera speaker).
 
 Tested on a **Wyze Cam v4** (T41NQ) and a **Wyze Cam v3** (T31X).
 
 ## Requirements on the camera
 
-- Thingino with the raptor streamer: `rvd` (video), `rad` (audio), and optionally `rmd` (motion).
+- Thingino with the raptor streamer: `rvd` (video), `rad` (audio, also plays talk-back), and optionally `rmd`
+  (motion). A raptor with an on-demand `aux` video stream enables per-viewer live view; rhkd uses it when present.
 - troglobit `mdnsd` for discovery. rhkd writes `/run/hap.service` and sends `mdnsd` a SIGHUP.
 - **Codecs:** at least one video stream (main or sub) set to `codec = h264`, and Opus on one of rad's audio
   outputs in `/etc/raptor.conf`: `[audio] codec = opus`, or, with a rad that has extra outputs, for example
@@ -105,12 +111,14 @@ helper and the web UI page. If there is no pairing store yet, it creates one. It
 | `RHKD_NAME` | hostname | Name shown when adding the camera |
 | `RHKD_STORE` | `/etc/homekit/store` | Pairing store (keys and pairings) |
 | `RHKD_LOG_LEVEL` | `2` | 0 none, 1 default, 2 info, 3 debug |
-| `RHKD_VIDEO_RING` | `auto` | `auto` (by requested bitrate), `main` or `sub` |
+| `RHKD_VIDEO_RING` | `auto` | `auto` (`aux` when present, else by requested bitrate), `main`, `sub` or `aux` |
 | `RHKD_SNAPSHOT_RING` | `jpeg1` | JPEG channel used for snapshots |
 | `RHKD_MOTION_MIN_HITS` / `_WINDOW_MS` / `_HOLD_SEC` | `2` / `3000` / `10` | Motion debounce |
 | `RHKD_AUDIO_CLOCK` | negotiated rate | Opus RTP clock; `48000` for RFC 7587 (HomeKit stutters with it) |
-| `RHKD_ADAPT_BITRATE` | `true` | Substream bitrate follows iOS during live view |
-| `RHKD_MIN_BITRATE_KBPS` | `300` | Lower limit for that |
+| `RHKD_ADAPT_BITRATE` | `true` | `sub`/`aux` bitrate follows iOS during live view |
+| `RHKD_MIN_BITRATE_KBPS` | `300` | Lower limit on `sub` (shared with other readers, e.g. an NVR's detect stream) |
+| `RHKD_MIN_AUX_BITRATE_KBPS` | `100` | Lower limit on `aux` (only HomeKit reads it) |
+| `RHKD_HDS_MAX_UNACKED_KB` | `256` | Recording back-pressure: unacknowledged data allowed before the next chunk; `0` turns pacing off |
 
 ## Pairing helper
 

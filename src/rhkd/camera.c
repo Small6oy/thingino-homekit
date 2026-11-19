@@ -23,6 +23,7 @@
 #include "opmode.h"
 #include "hds.h"
 #include "recording.h"
+#include "rtpdump.h"
 #include "rss_ipc.h"
 
 #include "App.h"
@@ -30,6 +31,7 @@
 #include "bitrate.h"
 #include "snapshot.h"
 #include "stream.h"
+#include "talkback.h"
 #include "tlvb.h"
 
 static const HAPLogObject logObject = { .subsystem = "rhkd", .category = "Camera" };
@@ -53,9 +55,13 @@ enum { kCmd_End = 0, kCmd_Start = 1, kCmd_Suspend = 2, kCmd_Resume = 3, kCmd_Rec
 // ---------------------------------------------------------------------------------------------------------------------
 // State (only touched on the HAP run loop thread).
 
-static struct {
-    HAPAccessoryServerRef* server;
-    HAPPlatformKeyValueStoreRef keyValueStore;
+// One per Camera RTP Stream Management service: each carries one live view, so two services allow two viewers at once
+// (as the G100 does). The first takes any size; the second is the extra viewer.
+typedef struct {
+    int index;
+    const HAPService* service;
+    const HAPCharacteristic* statusCharacteristic;
+    const HAPCharacteristic* activeCharacteristic;
     uint8_t active;
     uint8_t streamingStatus;
 
@@ -73,12 +79,38 @@ static struct {
 
     stream_t* stream;
     HAPSessionRef* streamSession;
+} rtp_slot_t;
+
+#define kRtpSlots 2
+
+static struct {
+    HAPAccessoryServerRef* server;
+    HAPPlatformKeyValueStoreRef keyValueStore;
+    rtp_slot_t slot[kRtpSlots];
     HAPPlatformTimerRef watchdog;
 } cam;
 
 extern const HAPAccessory* AppGetAccessoryInfo(void);
 static const HAPService cameraService;
+static const HAPService cameraService2;
 static const HAPTLV8Characteristic streamingStatusCharacteristic;
+static const HAPTLV8Characteristic streamingStatusCharacteristic2;
+static const HAPUInt8Characteristic activeCharacteristic;
+static const HAPUInt8Characteristic activeCharacteristic2;
+
+static rtp_slot_t* SlotFor(const HAPService* service) {
+    for (int i = 0; i < kRtpSlots; i++)
+        if (cam.slot[i].service && service && cam.slot[i].service->iid == service->iid)
+            return &cam.slot[i];
+    return &cam.slot[0];
+}
+
+static bool AnyStreaming(void) {
+    for (int i = 0; i < kRtpSlots; i++)
+        if (cam.slot[i].stream)
+            return true;
+    return false;
+}
 
 // Microphone mute (Microphone service). When muted, audio packets are not sent.
 static bool micMuted = false;
@@ -88,8 +120,8 @@ static bool micMuted = false;
 
 // Streaming is refused while the RTP service is inactive or the camera is turned off in Home (HomeKitCameraActive),
 // as HAP-NodeJS RTPStreamManagement.streamingIsDisabled does.
-static bool StreamingDisabled(void) {
-    return !cam.active || !opmode_homekit_active();
+static bool StreamingDisabled(const rtp_slot_t* s) {
+    return !s->active || !opmode_homekit_active();
 }
 
 // Appends every top-level item of a raw TLV buffer to an ADK TLV writer.
@@ -107,41 +139,43 @@ static HAPError EmitRaw(HAPTLVWriterRef* w, const uint8_t* buf, size_t len) {
     return kHAPError_None;
 }
 
-static void SetStreamingStatus(uint8_t status) {
-    if (cam.streamingStatus == status)
+static void SetStreamingStatus(rtp_slot_t* s, uint8_t status) {
+    if (s->streamingStatus == status)
         return;
-    cam.streamingStatus = status;
+    s->streamingStatus = status;
     if (cam.server)
-        HAPAccessoryServerRaiseEvent(
-                cam.server,
-                (const HAPCharacteristic*) &streamingStatusCharacteristic,
-                &cameraService,
-                AppGetAccessoryInfo());
+        HAPAccessoryServerRaiseEvent(cam.server, s->statusCharacteristic, s->service, AppGetAccessoryInfo());
 }
 
-static void CloseSetupSockets(void) {
-    if (cam.pending.videoSock >= 0)
-        close(cam.pending.videoSock);
-    if (cam.pending.audioSock >= 0)
-        close(cam.pending.audioSock);
-    cam.pending.videoSock = cam.pending.audioSock = -1;
+static void CloseSetupSockets(rtp_slot_t* s) {
+    if (s->pending.videoSock >= 0)
+        close(s->pending.videoSock);
+    if (s->pending.audioSock >= 0)
+        close(s->pending.audioSock);
+    s->pending.videoSock = s->pending.audioSock = -1;
 }
 
-static void EndSession(const char* why) {
-    if (cam.stream) {
-        HAPLogInfo(&logObject, "Ending stream (%s).", why);
-        stream_stop(cam.stream); // closes the sockets it owns
-        cam.stream = NULL;
-    } else if (cam.haveSetup) {
-        CloseSetupSockets();
+static void EndSession(rtp_slot_t* s, const char* why) {
+    if (s->stream) {
+        HAPLogInfo(&logObject, "Ending stream %d (%s).", s->index, why);
+        stream_stop(s->stream); // closes the sockets it owns
+        s->stream = NULL;
+    } else if (s->haveSetup) {
+        CloseSetupSockets(s);
     }
-    cam.haveSetup = false;
-    cam.streamSession = NULL;
-    cam.setupSession = NULL;
-    cam.selectedLen = 0;
-    bitrate_restore();
-    opmode_stream_ended();
-    SetStreamingStatus(kStreamingStatus_Available);
+    s->haveSetup = false;
+    s->streamSession = NULL;
+    s->setupSession = NULL;
+    s->selectedLen = 0;
+    bitrate_release(s->index);
+    if (!AnyStreaming())
+        opmode_stream_ended();
+    SetStreamingStatus(s, kStreamingStatus_Available);
+}
+
+static void EndAllSessions(const char* why) {
+    for (int i = 0; i < kRtpSlots; i++)
+        EndSession(&cam.slot[i], why);
 }
 
 static int BindUdp(int family, uint16_t* port) {
@@ -199,7 +233,8 @@ static const uint16_t kResolutions[][3] = {
     { 480, 360, 30 },   { 480, 270, 30 },  { 320, 240, 30 },  { 320, 240, 15 },  { 320, 180, 30 },
 };
 
-static size_t BuildSupportedVideo(uint8_t* out, size_t cap) {
+// maxWidth: the second RTP service offers up to 1280x720, like the certified Aqara G100 (its svc 2).
+static size_t BuildSupportedVideo(uint8_t* out, size_t cap, unsigned maxWidth) {
     uint8_t params[64], attrs[512], cfg[640];
     tlvb_t b;
 
@@ -218,15 +253,19 @@ static size_t BuildSupportedVideo(uint8_t* out, size_t cap) {
     size_t paramsLen = b.len;
 
     tlvb_init(&b, attrs, sizeof attrs);
+    bool first = true;
     for (size_t i = 0; i < HAPArrayCount(kResolutions); i++) {
+        if (kResolutions[i][0] > maxWidth)
+            continue;
         uint8_t a[16];
         tlvb_t ab;
         tlvb_init(&ab, a, sizeof a);
         tlvb_u16(&ab, 0x01, kResolutions[i][0]);
         tlvb_u16(&ab, 0x02, kResolutions[i][1]);
         tlvb_u8(&ab, 0x03, (uint8_t) kResolutions[i][2]);
-        if (i)
+        if (!first)
             tlvb_sep(&b);
+        first = false;
         tlvb_put(&b, 0x03, a, ab.len);
     }
     size_t attrsLen = b.len;
@@ -267,13 +306,16 @@ static size_t BuildSupportedAudio(uint8_t* out, size_t cap) {
 // ---------------------------------------------------------------------------------------------------------------------
 // Characteristic handlers
 
+#define kIID_Camera2SupportedVideo   ((uint64_t) 0x00A2) // also below, with the second service
+
 static HAPError HandleSupportedVideoRead(
         HAPAccessoryServerRef* server HAP_UNUSED,
-        const HAPTLV8CharacteristicReadRequest* request HAP_UNUSED,
+        const HAPTLV8CharacteristicReadRequest* request,
         HAPTLVWriterRef* w,
         void* _Nullable context HAP_UNUSED) {
     uint8_t buf[1024];
-    size_t n = BuildSupportedVideo(buf, sizeof buf);
+    size_t n = BuildSupportedVideo(buf, sizeof buf,
+                                   request->characteristic->iid == kIID_Camera2SupportedVideo ? 1280 : 1920);
     return n ? EmitRaw(w, buf, n) : kHAPError_Unknown;
 }
 
@@ -298,25 +340,27 @@ static HAPError HandleSupportedRTPRead(
 
 static HAPError HandleStreamingStatusRead(
         HAPAccessoryServerRef* server HAP_UNUSED,
-        const HAPTLV8CharacteristicReadRequest* request HAP_UNUSED,
+        const HAPTLV8CharacteristicReadRequest* request,
         HAPTLVWriterRef* w,
         void* _Nullable context HAP_UNUSED) {
-    uint8_t st = cam.active ? cam.streamingStatus : kStreamingStatus_Unavailable;
+    rtp_slot_t* s = SlotFor(request->service);
+    uint8_t st = s->active ? s->streamingStatus : kStreamingStatus_Unavailable;
     return HAPTLVWriterAppend(w, &(const HAPTLV) { .type = 0x01, .value = { .bytes = &st, .numBytes = 1 } });
 }
 
 static HAPError HandleSetupEndpointsRead(
         HAPAccessoryServerRef* server HAP_UNUSED,
-        const HAPTLV8CharacteristicReadRequest* request HAP_UNUSED,
+        const HAPTLV8CharacteristicReadRequest* request,
         HAPTLVWriterRef* w,
         void* _Nullable context HAP_UNUSED) {
-    if (StreamingDisabled()) {
+    rtp_slot_t* s = SlotFor(request->service);
+    if (StreamingDisabled(s)) {
         uint8_t status = kSetupStatus_Error; // as HAP-NodeJS while streaming is disabled
         return HAPTLVWriterAppend(w, &(const HAPTLV) { .type = 0x02, .value = { .bytes = &status, .numBytes = 1 } });
     }
-    if (!cam.setupResponseLen)
+    if (!s->setupResponseLen)
         return kHAPError_None; // empty until a controller sets up endpoints (as HAP-NodeJS does)
-    return EmitRaw(w, cam.setupResponse, cam.setupResponseLen);
+    return EmitRaw(w, s->setupResponse, s->setupResponseLen);
 }
 
 // Collects the raw bytes of a write into a flat TLV buffer (re-encoded so our parser can walk it).
@@ -341,7 +385,8 @@ static HAPError HandleSetupEndpointsWrite(
         const HAPTLV8CharacteristicWriteRequest* request,
         HAPTLVReaderRef* r,
         void* _Nullable context HAP_UNUSED) {
-    if (StreamingDisabled()) {
+    rtp_slot_t* slot = SlotFor(request->service);
+    if (StreamingDisabled(slot)) {
         HAPLogInfo(&logObject, "SetupEndpoints refused: streaming is disabled.");
         return kHAPError_InvalidState;
     }
@@ -361,20 +406,20 @@ static HAPError HandleSetupEndpointsWrite(
     }
 
     // A stream that died on its own (timeout) frees the slot.
-    if (cam.stream && stream_finished(cam.stream))
-        EndSession("finished");
+    if (slot->stream && stream_finished(slot->stream))
+        EndSession(slot, "finished");
 
     tlvb_t b;
-    if (cam.stream) {
-        HAPLogInfo(&logObject, "SetupEndpoints: busy.");
-        tlvb_init(&b, cam.setupResponse, sizeof cam.setupResponse);
+    if (slot->stream) {
+        HAPLogInfo(&logObject, "SetupEndpoints %d: busy.", slot->index);
+        tlvb_init(&b, slot->setupResponse, sizeof slot->setupResponse);
         tlvb_put(&b, 0x01, sid, 16);
         tlvb_u8(&b, 0x02, kSetupStatus_Busy);
-        cam.setupResponseLen = b.len;
+        slot->setupResponseLen = b.len;
         return kHAPError_None;
     }
-    if (cam.haveSetup) // a previous setup that never started
-        CloseSetupSockets();
+    if (slot->haveSetup) // a previous setup that never started
+        CloseSetupSockets(slot);
 
     uint8_t ver = 0;
     uint16_t vport = 0, aport = 0;
@@ -386,7 +431,7 @@ static HAPError HandleSetupEndpointsWrite(
     tlv_get_u16(addr, addrLen, 0x04, &aport);
     ip[ipLen] = '\0';
 
-    stream_params_t* p = &cam.pending;
+    stream_params_t* p = &slot->pending;
     memset(p, 0, sizeof *p);
     p->videoSock = p->audioSock = -1;
     int family = ver == 1 ? AF_INET6 : AF_INET;
@@ -426,7 +471,7 @@ static HAPError HandleSetupEndpointsWrite(
     p->audioSock = BindUdp(family, &myAport);
     char myIp[64];
     if (p->videoSock < 0 || p->audioSock < 0 || !LocalAddressFor(&p->videoDst, p->videoDstLen, myIp, sizeof myIp)) {
-        CloseSetupSockets();
+        CloseSetupSockets(slot);
         return kHAPError_Unknown;
     }
     RandomBytes(&p->videoSSRC, 4);
@@ -457,7 +502,7 @@ static HAPError HandleSetupEndpointsWrite(
     tlvb_put(&t, 0x03, as_, 14);
     size_t asLen = t.len;
 
-    tlvb_init(&b, cam.setupResponse, sizeof cam.setupResponse);
+    tlvb_init(&b, slot->setupResponse, sizeof slot->setupResponse);
     tlvb_put(&b, 0x01, sid, 16);
     tlvb_u8(&b, 0x02, kSetupStatus_Success);
     tlvb_put(&b, 0x03, aaddr, aaddrLen);
@@ -465,13 +510,13 @@ static HAPError HandleSetupEndpointsWrite(
     tlvb_put(&b, 0x05, as, asLen);
     tlvb_u32(&b, 0x06, p->videoSSRC);
     tlvb_u32(&b, 0x07, p->audioSSRC);
-    cam.setupResponseLen = b.len;
+    slot->setupResponseLen = b.len;
 
-    memcpy(cam.sessionId, sid, 16);
-    cam.haveSetup = true;
-    cam.setupSession = request->session;
-    HAPLogInfo(&logObject, "SetupEndpoints: controller %s:%u (video) -> us %s:%u.", ip, vport, myIp, myVport);
-    SetStreamingStatus(kStreamingStatus_InUse);
+    memcpy(slot->sessionId, sid, 16);
+    slot->haveSetup = true;
+    slot->setupSession = request->session;
+    HAPLogInfo(&logObject, "SetupEndpoints %d: controller %s:%u (video) -> us %s:%u.", slot->index, ip, vport, myIp, myVport);
+    SetStreamingStatus(slot, kStreamingStatus_InUse);
     return kHAPError_None;
 }
 
@@ -492,19 +537,68 @@ static const char* OpusRingName(void) {
     return "audio";
 }
 
+static bool RingTaken(const rtp_slot_t* self, const char* ring) {
+    for (int i = 0; i < kRtpSlots; i++) {
+        const rtp_slot_t* o = &cam.slot[i];
+        if (o != self && o->stream && o->pending.ringName && strcmp(o->pending.ringName, ring) == 0)
+            return true;
+    }
+    return false;
+}
+
+// Live-view source. iOS states its budget as size + max bitrate; on the LAN it asks for 1280x720 at ~300 kbit/s.
+// - aux (rvd [stream2], on demand): a per-session encoder at its configured size, whose bitrate follows this session
+//   (bitrate.c). Used when no other session holds it and the request fits it -- or iOS asks for < 1 Mbit/s, where a
+//   smaller picture at the asked bitrate beats main at its fixed one.
+// - sub (640x360): small requests, or a tight budget when aux is absent or taken; its bitrate follows the session.
+// - main: the full picture at its configured bitrate (shared with recordings, never changed).
+// RHKD_VIDEO_RING=main|sub|aux forces one. HomeKit takes H.264 only, so a non-H.264 choice falls back.
+static const char* ChooseVideoRing(const rtp_slot_t* slot, const stream_params_t* p) {
+    static const char* const kRings[] = { "main", "sub", "aux" };
+    const char* force = getenv("RHKD_VIDEO_RING");
+    for (unsigned i = 0; force && i < HAPArrayCount(kRings); i++)
+        if (strcmp(force, kRings[i]) == 0)
+            return kRings[i];
+    bool lowBudget = p->maxBitrateKbps && p->maxBitrateKbps < 1000;
+    stream_ring_info_t aux;
+    if (p->width > 640 && stream_ring_info("aux", &aux) && aux.codec == 0 && !RingTaken(slot, "aux") &&
+        (lowBudget || (p->width <= aux.width && p->height <= aux.height)))
+        return "aux";
+    const char* ring = lowBudget || p->width <= 640 ? "sub" : "main";
+    // main is never slowed down (recordings, Frigate), so only use it when iOS's budget covers its configured rate;
+    // a certified camera stays at the bitrate iOS asks for (aqara-g100.md, HAP-NodeJS #959).
+    if (strcmp(ring, "main") == 0 && p->maxBitrateKbps && stream_ring_codec("sub") == 0) {
+        unsigned mainKbps = bitrate_configured_kbps("main");
+        if (mainKbps && p->maxBitrateKbps < mainKbps) {
+            HAPLogInfo(&logObject, "main runs at %u kbit/s, above the %u iOS allows; using sub.", mainKbps,
+                       p->maxBitrateKbps);
+            ring = "sub";
+        }
+    }
+    if (stream_ring_codec(ring) != 0) {
+        const char* other = strcmp(ring, "main") == 0 ? "sub" : "main";
+        if (stream_ring_codec(other) == 0) {
+            HAPLogInfo(&logObject, "Ring %s is not H.264; using %s instead.", ring, other);
+            ring = other;
+        }
+    }
+    return ring;
+}
+
 static HAPError HandleSelectedRead(
         HAPAccessoryServerRef* server HAP_UNUSED,
-        const HAPTLV8CharacteristicReadRequest* request HAP_UNUSED,
+        const HAPTLV8CharacteristicReadRequest* request,
         HAPTLVWriterRef* w,
         void* _Nullable context HAP_UNUSED) {
-    if (StreamingDisabled()) {
+    rtp_slot_t* slot = SlotFor(request->service);
+    if (StreamingDisabled(slot)) {
         // HAP-NodeJS answers {01 session control {02 command = suspend}} while streaming is disabled.
         const uint8_t suspend[] = { 0x02, 0x01, kCmd_Suspend };
         return HAPTLVWriterAppend(w, &(const HAPTLV) { .type = 0x01, .value = { .bytes = suspend, .numBytes = sizeof suspend } });
     }
-    if (!cam.selectedLen)
+    if (!slot->selectedLen)
         return kHAPError_None; // empty until a stream is selected (as HAP-NodeJS does)
-    return EmitRaw(w, cam.selected, cam.selectedLen);
+    return EmitRaw(w, slot->selected, slot->selectedLen);
 }
 
 static HAPError HandleSelectedWrite(
@@ -512,6 +606,7 @@ static HAPError HandleSelectedWrite(
         const HAPTLV8CharacteristicWriteRequest* request,
         HAPTLVReaderRef* r,
         void* _Nullable context HAP_UNUSED) {
+    rtp_slot_t* slot = SlotFor(request->service);
     uint8_t req[512];
     size_t reqLen;
     if (!CollectWrite(r, req, sizeof req, &reqLen))
@@ -523,14 +618,15 @@ static HAPError HandleSelectedWrite(
     if (!tlv_get(req, reqLen, 0x01, ctl, sizeof ctl, &ctlLen) || !tlv_get_u8(ctl, ctlLen, 0x02, &cmd))
         return kHAPError_InvalidData;
 
-    HAPLogInfo(&logObject, "SelectedRTPStreamConfiguration: command %u.", cmd);
+    HAPLogInfo(&logObject, "SelectedRTPStreamConfiguration %d: command %u.", slot->index, cmd);
+    rtpdump_selected(slot->index, req, reqLen);
     switch (cmd) {
         case kCmd_Start: {
-            if (StreamingDisabled()) {
+            if (StreamingDisabled(slot)) {
                 HAPLogInfo(&logObject, "Start refused: streaming is disabled.");
                 return kHAPError_InvalidState;
             }
-            if (!cam.haveSetup || cam.stream) {
+            if (!slot->haveSetup || slot->stream) {
                 HAPLogError(&logObject, "Start without a pending setup.");
                 return kHAPError_InvalidState;
             }
@@ -540,7 +636,7 @@ static HAPError HandleSelectedWrite(
                 !tlv_get(vp, vpLen, 0x03, attrs, sizeof attrs, &attrsLen) ||
                 !tlv_get(vp, vpLen, 0x04, rtp, sizeof rtp, &rtpLen))
                 return kHAPError_InvalidData;
-            stream_params_t* p = &cam.pending;
+            stream_params_t* p = &slot->pending;
             uint8_t fps = 0, pt = 99;
             tlv_get_u16(attrs, attrsLen, 0x01, &p->width);
             tlv_get_u16(attrs, attrsLen, 0x02, &p->height);
@@ -553,25 +649,7 @@ static HAPError HandleSelectedWrite(
             tlv_get_u16(rtp, rtpLen, 0x05, &p->mtu);
             if (!p->mtu)
                 p->mtu = p->videoDst.ss_family == AF_INET6 ? 1228 : 1378;
-            // Pick the source stream. iOS states its budget in max bitrate: on the LAN it asks for ~300 kbit/s
-            // even at 1280x720. main (2560x1440, ~3 Mbit/s) is 10x over that; sub (640x360, ~1 Mbit/s) is
-            // much closer. RHKD_VIDEO_RING=main|sub forces one; default "auto" chooses by bitrate.
-            {
-                const char* force = getenv("RHKD_VIDEO_RING");
-                if (force && (strcmp(force, "main") == 0 || strcmp(force, "sub") == 0))
-                    p->ringName = strcmp(force, "main") == 0 ? "main" : "sub";
-                else
-                    p->ringName = (p->maxBitrateKbps && p->maxBitrateKbps < 1000) || p->width <= 640 ? "sub" : "main";
-                // HomeKit takes H.264 only. If the chosen stream is H.265 (e.g. main kept on H.265 for recording),
-                // use the other one when it is H.264; if neither is, the stream thread logs why and stops.
-                if (stream_ring_codec(p->ringName) != 0) {
-                    const char* other = strcmp(p->ringName, "main") == 0 ? "sub" : "main";
-                    if (stream_ring_codec(other) == 0) {
-                        HAPLogInfo(&logObject, "Ring %s is not H.264; using %s instead.", p->ringName, other);
-                        p->ringName = other;
-                    }
-                }
-            }
+            p->ringName = ChooseVideoRing(slot, p);
 
             // Audio: 03 {01 codec, 02 params {01 channels, 02 bitrate mode, 03 sample rate, 04 rtp time},
             //            03 rtp {01 pt, 02 ssrc, 03 max bitrate, 04 rtcp interval}, 04 comfort noise}
@@ -602,7 +680,8 @@ static HAPError HandleSelectedWrite(
             }
             HAPLogInfo(
                     &logObject,
-                    "Start: %ux%u@%u, max %u kbit/s, pt %u, mtu %u -> ring %s.",
+                    "Start %d: %ux%u@%u, max %u kbit/s, pt %u, mtu %u -> ring %s.",
+                    slot->index,
                     p->width,
                     p->height,
                     p->fps,
@@ -610,25 +689,25 @@ static HAPError HandleSelectedWrite(
                     p->payloadType,
                     p->mtu,
                     p->ringName);
-            cam.stream = stream_start(p); // takes ownership of the sockets
-            stream_set_audio_muted(cam.stream, micMuted);
-            if (!cam.stream) {
-                CloseSetupSockets();
-                cam.haveSetup = false;
-                SetStreamingStatus(kStreamingStatus_Available);
+            slot->stream = stream_start(p); // takes ownership of the sockets
+            stream_set_audio_muted(slot->stream, micMuted);
+            if (!slot->stream) {
+                CloseSetupSockets(slot);
+                slot->haveSetup = false;
+                SetStreamingStatus(slot, kStreamingStatus_Available);
                 return kHAPError_Unknown;
             }
-            cam.streamSession = request->session;
-            bitrate_apply(p->ringName, p->maxBitrateKbps);
+            slot->streamSession = request->session;
+            bitrate_apply(slot->index, p->ringName, p->maxBitrateKbps);
             opmode_stream_started();
-            if (reqLen <= sizeof cam.selected) {
-                memcpy(cam.selected, req, reqLen);
-                cam.selectedLen = reqLen;
+            if (reqLen <= sizeof slot->selected) {
+                memcpy(slot->selected, req, reqLen);
+                slot->selectedLen = reqLen;
             }
             break;
         }
         case kCmd_End:
-            EndSession("controller ended session");
+            EndSession(slot, "controller ended session");
             break;
         case kCmd_Reconfigure: {
             // Same layout as Start: 02 {03 attributes {01 w, 02 h, 03 fps}, 04 rtp {03 max bitrate}}; all optional.
@@ -645,14 +724,19 @@ static HAPError HandleSelectedWrite(
                 if (tlv_get(vp, vpLen, 0x04, rtp, sizeof rtp, &rtpLen))
                     tlv_get_u16(rtp, rtpLen, 0x03, &kbps);
             }
-            HAPLogInfo(&logObject, "Reconfigure: %ux%u@%u, max %u kbit/s.", w, h, fps, kbps);
-            if (cam.stream && kbps)
-                bitrate_apply(cam.pending.ringName, kbps);
-            stream_request_idr(cam.stream);
+            // The source size is fixed per session (sub/aux/main as chosen at Start); rvd can't resize aux safely
+            // yet, so only the bitrate follows.
+            HAPLogInfo(&logObject, "Reconfigure %d: %ux%u@%u, max %u kbit/s.", slot->index, w, h, fps, kbps);
+            if (slot->stream && kbps)
+                bitrate_apply(slot->index, slot->pending.ringName, kbps);
+            stream_request_idr(slot->stream);
             break;
         }
-        case kCmd_Suspend:
+        case kCmd_Suspend: // e.g. the Home app went to the background: stop media, keep the session
         case kCmd_Resume:
+            HAPLogInfo(&logObject, "%s %d.", cmd == kCmd_Suspend ? "Suspend" : "Resume", slot->index);
+            stream_set_paused(slot->stream, cmd == kCmd_Suspend);
+            break;
         default:
             break;
     }
@@ -661,10 +745,10 @@ static HAPError HandleSelectedWrite(
 
 static HAPError HandleActiveRead(
         HAPAccessoryServerRef* server HAP_UNUSED,
-        const HAPUInt8CharacteristicReadRequest* request HAP_UNUSED,
+        const HAPUInt8CharacteristicReadRequest* request,
         uint8_t* value,
         void* _Nullable context HAP_UNUSED) {
-    *value = cam.active;
+    *value = SlotFor(request->service)->active;
     return kHAPError_None;
 }
 
@@ -673,11 +757,12 @@ static HAPError HandleActiveWrite(
         const HAPUInt8CharacteristicWriteRequest* request,
         uint8_t value,
         void* _Nullable context HAP_UNUSED) {
-    HAPLogInfo(&logObject, "Active <- %u", value);
-    if (cam.active != value) {
-        cam.active = value;
+    rtp_slot_t* slot = SlotFor(request->service);
+    HAPLogInfo(&logObject, "Active %d <- %u", slot->index, value);
+    if (slot->active != value) {
+        slot->active = value;
         if (!value)
-            EndSession("camera deactivated");
+            EndSession(slot, "camera deactivated");
         HAPAccessoryServerRaiseEvent(server, request->characteristic, request->service, request->accessory);
     }
     return kHAPError_None;
@@ -690,7 +775,7 @@ size_t HAPCameraTakeSnapshot(uint16_t width, uint16_t height, int reason, uint8_
     HAPLogInfo(&logObject, "Snapshot requested %ux%u (reason %d).", width, height, reason);
     // As HAP-NodeJS CameraController.handleSnapshotRequest: no snapshots while streaming is off or the
     // operating mode forbids this kind of snapshot.
-    if (!cam.active || !opmode_snapshot_allowed(reason)) {
+    if (!cam.slot[0].active || !opmode_snapshot_allowed(reason)) {
         HAPLogInfo(&logObject, "Snapshot refused by the operating mode.");
         return 0;
     }
@@ -801,6 +886,92 @@ static const HAPService cameraService = {
                                                             NULL },
 };
 
+// Second Camera RTP Stream Management service: a second live viewer at the same time (own session, own source).
+#define kIID_Camera2                 ((uint64_t) 0x00A0)
+#define kIID_Camera2StreamingStatus  ((uint64_t) 0x00A1)
+#define kIID_Camera2SupportedVideo   ((uint64_t) 0x00A2)
+#define kIID_Camera2SupportedAudio   ((uint64_t) 0x00A3)
+#define kIID_Camera2SupportedRTP     ((uint64_t) 0x00A4)
+#define kIID_Camera2Selected         ((uint64_t) 0x00A5)
+#define kIID_Camera2SetupEndpoints   ((uint64_t) 0x00A6)
+#define kIID_Camera2Active           ((uint64_t) 0x00A7)
+
+static const HAPTLV8Characteristic streamingStatusCharacteristic2 = {
+    .format = kHAPCharacteristicFormat_TLV8,
+    .iid = kIID_Camera2StreamingStatus,
+    .characteristicType = &kCharType_StreamingStatus,
+    .debugDescription = "streaming-status",
+    .properties = TLV8_PROPS(true, false, true),
+    .callbacks = { .handleRead = HandleStreamingStatusRead },
+};
+static const HAPTLV8Characteristic supportedVideoCharacteristic2 = {
+    .format = kHAPCharacteristicFormat_TLV8,
+    .iid = kIID_Camera2SupportedVideo,
+    .characteristicType = &kCharType_SupportedVideoStreamConfiguration,
+    .debugDescription = "supported-video-stream-configuration",
+    .properties = TLV8_PROPS(true, false, false),
+    .callbacks = { .handleRead = HandleSupportedVideoRead },
+};
+static const HAPTLV8Characteristic supportedAudioCharacteristic2 = {
+    .format = kHAPCharacteristicFormat_TLV8,
+    .iid = kIID_Camera2SupportedAudio,
+    .characteristicType = &kCharType_SupportedAudioStreamConfiguration,
+    .debugDescription = "supported-audio-stream-configuration",
+    .properties = TLV8_PROPS(true, false, false),
+    .callbacks = { .handleRead = HandleSupportedAudioRead },
+};
+static const HAPTLV8Characteristic supportedRTPCharacteristic2 = {
+    .format = kHAPCharacteristicFormat_TLV8,
+    .iid = kIID_Camera2SupportedRTP,
+    .characteristicType = &kCharType_SupportedRTPConfiguration,
+    .debugDescription = "supported-rtp-configuration",
+    .properties = TLV8_PROPS(true, false, false),
+    .callbacks = { .handleRead = HandleSupportedRTPRead },
+};
+static const HAPTLV8Characteristic selectedCharacteristic2 = {
+    .format = kHAPCharacteristicFormat_TLV8,
+    .iid = kIID_Camera2Selected,
+    .characteristicType = &kCharType_SelectedRTPStreamConfiguration,
+    .debugDescription = "selected-rtp-stream-configuration",
+    .properties = TLV8_PROPS(true, true, false),
+    .callbacks = { .handleRead = HandleSelectedRead, .handleWrite = HandleSelectedWrite },
+};
+static const HAPTLV8Characteristic setupEndpointsCharacteristic2 = {
+    .format = kHAPCharacteristicFormat_TLV8,
+    .iid = kIID_Camera2SetupEndpoints,
+    .characteristicType = &kCharType_SetupEndpoints,
+    .debugDescription = "setup-endpoints",
+    .properties = TLV8_PROPS(true, true, false),
+    .callbacks = { .handleRead = HandleSetupEndpointsRead, .handleWrite = HandleSetupEndpointsWrite },
+};
+static const HAPUInt8Characteristic activeCharacteristic2 = {
+    .format = kHAPCharacteristicFormat_UInt8,
+    .iid = kIID_Camera2Active,
+    .characteristicType = &kHAPCharacteristicType_Active,
+    .debugDescription = kHAPCharacteristicDebugDescription_Active,
+    .properties = TLV8_PROPS(true, true, true),
+    .units = kHAPCharacteristicUnits_None,
+    .constraints = { .minimumValue = 0, .maximumValue = 1, .stepValue = 1 },
+    .callbacks = { .handleRead = HandleActiveRead, .handleWrite = HandleActiveWrite },
+};
+
+static const HAPService cameraService2 = {
+    .iid = kIID_Camera2,
+    .serviceType = &kHAPServiceType_CameraRTPStreamManagement,
+    .debugDescription = kHAPServiceDebugDescription_CameraRTPStreamManagement,
+    .name = NULL,
+    .properties = { .primaryService = false, .hidden = false, .ble = { .supportsConfiguration = false } },
+    .linkedServices = NULL,
+    .characteristics = (const HAPCharacteristic* const[]) { &streamingStatusCharacteristic2,
+                                                            &supportedVideoCharacteristic2,
+                                                            &supportedAudioCharacteristic2,
+                                                            &supportedRTPCharacteristic2,
+                                                            &selectedCharacteristic2,
+                                                            &setupEndpointsCharacteristic2,
+                                                            &activeCharacteristic2,
+                                                            NULL },
+};
+
 // Microphone service: required on IP cameras by the HAP spec. Mute stops the audio packets.
 #define kIID_Microphone     ((uint64_t) 0x0040)
 #define kIID_MicrophoneMute ((uint64_t) 0x0041)
@@ -824,7 +995,8 @@ static HAPError HandleMuteWrite(
     HAPLogInfo(&logObject, "Microphone mute <- %d", value);
     if (micMuted != value) {
         micMuted = value;
-        stream_set_audio_muted(cam.stream, value);
+        for (int i = 0; i < kRtpSlots; i++)
+            stream_set_audio_muted(cam.slot[i].stream, value);
         HAPAccessoryServerRaiseEvent(server, request->characteristic, request->service, request->accessory);
     }
     return kHAPError_None;
@@ -848,6 +1020,243 @@ static const HAPService microphoneService = {
     .linkedServices = NULL,
     .characteristics = (const HAPCharacteristic* const[]) { &muteCharacteristic, NULL },
 };
+
+// Speaker service: two-way audio. Its presence makes Home show the talk button; the controller's Opus then arrives
+// on the session's audio socket and goes to rad's speaker ring (talkback.c). Mute and Volume act on that audio
+// (Volume scales it; rad's ao_volume stays the overall level).
+#define kIID_Speaker       ((uint64_t) 0x0090)
+#define kIID_SpeakerMute   ((uint64_t) 0x0091)
+#define kIID_SpeakerVolume ((uint64_t) 0x0092)
+static const HAPUUID kCharType_Volume = HAPUUIDCreateAppleDefined(0x119);
+
+static HAPError HandleSpeakerMuteRead(
+        HAPAccessoryServerRef* server HAP_UNUSED,
+        const HAPBoolCharacteristicReadRequest* request HAP_UNUSED,
+        bool* value,
+        void* _Nullable context HAP_UNUSED) {
+    *value = talkback_muted();
+    return kHAPError_None;
+}
+
+static HAPError HandleSpeakerMuteWrite(
+        HAPAccessoryServerRef* server,
+        const HAPBoolCharacteristicWriteRequest* request,
+        bool value,
+        void* _Nullable context HAP_UNUSED) {
+    HAPLogInfo(&logObject, "Speaker mute <- %d", value);
+    if (talkback_muted() != value) {
+        talkback_set_muted(value);
+        HAPAccessoryServerRaiseEvent(server, request->characteristic, request->service, request->accessory);
+    }
+    return kHAPError_None;
+}
+
+static HAPError HandleSpeakerVolumeRead(
+        HAPAccessoryServerRef* server HAP_UNUSED,
+        const HAPUInt8CharacteristicReadRequest* request HAP_UNUSED,
+        uint8_t* value,
+        void* _Nullable context HAP_UNUSED) {
+    *value = talkback_volume();
+    return kHAPError_None;
+}
+
+static HAPError HandleSpeakerVolumeWrite(
+        HAPAccessoryServerRef* server,
+        const HAPUInt8CharacteristicWriteRequest* request,
+        uint8_t value,
+        void* _Nullable context HAP_UNUSED) {
+    HAPLogInfo(&logObject, "Speaker volume <- %u", value);
+    if (talkback_volume() != value) {
+        talkback_set_volume(value);
+        HAPAccessoryServerRaiseEvent(server, request->characteristic, request->service, request->accessory);
+    }
+    return kHAPError_None;
+}
+
+static const HAPBoolCharacteristic speakerMuteCharacteristic = {
+    .format = kHAPCharacteristicFormat_Bool,
+    .iid = kIID_SpeakerMute,
+    .characteristicType = &kCharType_Mute,
+    .debugDescription = "mute",
+    .properties = TLV8_PROPS(true, true, true),
+    .callbacks = { .handleRead = HandleSpeakerMuteRead, .handleWrite = HandleSpeakerMuteWrite },
+};
+
+static const HAPUInt8Characteristic speakerVolumeCharacteristic = {
+    .format = kHAPCharacteristicFormat_UInt8,
+    .iid = kIID_SpeakerVolume,
+    .characteristicType = &kCharType_Volume,
+    .debugDescription = "volume",
+    .properties = TLV8_PROPS(true, true, true),
+    .units = kHAPCharacteristicUnits_Percentage,
+    .constraints = { .minimumValue = 0, .maximumValue = 100, .stepValue = 1 },
+    .callbacks = { .handleRead = HandleSpeakerVolumeRead, .handleWrite = HandleSpeakerVolumeWrite },
+};
+
+static const HAPService speakerService = {
+    .iid = kIID_Speaker,
+    .serviceType = &kHAPServiceType_Speaker,
+    .debugDescription = kHAPServiceDebugDescription_Speaker,
+    .name = NULL,
+    .properties = { .primaryService = false, .hidden = false, .ble = { .supportsConfiguration = false } },
+    .linkedServices = NULL,
+    .characteristics = (const HAPCharacteristic* const[]) { &speakerMuteCharacteristic,
+                                                            &speakerVolumeCharacteristic,
+                                                            NULL },
+};
+
+// "Echo Cancellation" switch: when on, rad's acoustic echo cancellation runs while someone talks through the camera,
+// so the live view's microphone doesn't play the speaker's sound back (talkback.c). Kept in the key-value store.
+#define kIID_EchoSwitch     ((uint64_t) 0x00B0)
+#define kIID_EchoSwitchOn   ((uint64_t) 0x00B1)
+#define kIID_EchoSwitchName ((uint64_t) 0x00B2)
+#define kIID_EchoSwitchConfiguredName ((uint64_t) 0x00B3)
+#define kAppKVSKey_EchoCancel ((HAPPlatformKeyValueStoreKey) 0x04) // domain 0x00; 0x01-0x03 are taken
+#define kIID_MotionName           ((uint64_t) 0x0053)
+#define kIID_MotionConfiguredName ((uint64_t) 0x0054)
+
+// Home labels a non-primary service by its Configured Name; without one it shows the accessory's name ("Wyze v4"
+// for the switch and the motion sensor). A rename in Home writes it; it is kept in the key-value store.
+static const HAPUUID kCharType_ConfiguredName = HAPUUIDCreateAppleDefined(0xE3);
+typedef struct {
+    uint64_t nameIid, configuredIid;
+    HAPPlatformKeyValueStoreKey key; // domain 0x00
+    char name[65];
+} service_name_t;
+static service_name_t gNames[] = {
+    { kIID_EchoSwitchName, kIID_EchoSwitchConfiguredName, 0x05, "Echo Cancellation" },
+    { kIID_MotionName, kIID_MotionConfiguredName, 0x06, "Motion" },
+};
+
+static service_name_t* NameFor(uint64_t iid) {
+    for (size_t i = 0; i < HAPArrayCount(gNames); i++)
+        if (gNames[i].nameIid == iid || gNames[i].configuredIid == iid)
+            return &gNames[i];
+    return NULL;
+}
+
+static HAPError HandleEchoOnRead(
+        HAPAccessoryServerRef* server HAP_UNUSED,
+        const HAPBoolCharacteristicReadRequest* request HAP_UNUSED,
+        bool* value,
+        void* _Nullable context HAP_UNUSED) {
+    *value = talkback_echo_cancel();
+    return kHAPError_None;
+}
+
+static HAPError HandleEchoOnWrite(
+        HAPAccessoryServerRef* server,
+        const HAPBoolCharacteristicWriteRequest* request,
+        bool value,
+        void* _Nullable context HAP_UNUSED) {
+    HAPLogInfo(&logObject, "Echo cancellation <- %d", value);
+    if (talkback_echo_cancel() != value) {
+        talkback_set_echo_cancel(value);
+        uint8_t b = value;
+        if (HAPPlatformKeyValueStoreSet(cam.keyValueStore, (HAPPlatformKeyValueStoreDomain) 0x00,
+                                        kAppKVSKey_EchoCancel, &b, 1))
+            HAPLogError(&logObject, "Could not save the echo cancellation setting.");
+        HAPAccessoryServerRaiseEvent(server, request->characteristic, request->service, request->accessory);
+    }
+    return kHAPError_None;
+}
+
+static HAPError HandleServiceNameRead(
+        HAPAccessoryServerRef* server HAP_UNUSED,
+        const HAPStringCharacteristicReadRequest* request,
+        char* value,
+        size_t maxValueBytes,
+        void* _Nullable context HAP_UNUSED) {
+    service_name_t* e = NameFor(request->characteristic->iid);
+    if (!e)
+        return kHAPError_Unknown;
+    size_t n = strlen(e->name) + 1;
+    if (maxValueBytes < n)
+        return kHAPError_OutOfResources;
+    memcpy(value, e->name, n);
+    return kHAPError_None;
+}
+
+static HAPError HandleServiceNameWrite(
+        HAPAccessoryServerRef* server,
+        const HAPStringCharacteristicWriteRequest* request,
+        const char* value,
+        void* _Nullable context HAP_UNUSED) {
+    service_name_t* e = NameFor(request->characteristic->iid);
+    size_t n = strlen(value);
+    if (!e || n == 0 || n >= sizeof e->name)
+        return kHAPError_InvalidData;
+    if (strcmp(value, e->name) == 0)
+        return kHAPError_None;
+    memcpy(e->name, value, n + 1);
+    HAPLogInfo(&logObject, "Service %llu renamed to \"%s\".", (unsigned long long) request->service->iid, e->name);
+    if (HAPPlatformKeyValueStoreSet(cam.keyValueStore, (HAPPlatformKeyValueStoreDomain) 0x00, e->key, e->name, n))
+        HAPLogError(&logObject, "Could not save the service name.");
+    HAPAccessoryServerRaiseEvent(server, request->characteristic, request->service, request->accessory);
+    return kHAPError_None;
+}
+
+static void LoadServiceNames(void) {
+    for (size_t i = 0; i < HAPArrayCount(gNames); i++) {
+        char name[sizeof gNames[i].name];
+        size_t n = 0;
+        bool found = false;
+        if (!HAPPlatformKeyValueStoreGet(cam.keyValueStore, (HAPPlatformKeyValueStoreDomain) 0x00, gNames[i].key,
+                                         name, sizeof name - 1, &n, &found) && found && n > 0) {
+            name[n] = 0;
+            memcpy(gNames[i].name, name, n + 1);
+        }
+    }
+}
+
+static const HAPBoolCharacteristic echoOnCharacteristic = {
+    .format = kHAPCharacteristicFormat_Bool,
+    .iid = kIID_EchoSwitchOn,
+    .characteristicType = &kHAPCharacteristicType_On,
+    .debugDescription = kHAPCharacteristicDebugDescription_On,
+    .properties = TLV8_PROPS(true, true, true),
+    .callbacks = { .handleRead = HandleEchoOnRead, .handleWrite = HandleEchoOnWrite },
+};
+
+static const HAPStringCharacteristic echoNameCharacteristic = {
+    .format = kHAPCharacteristicFormat_String,
+    .iid = kIID_EchoSwitchName,
+    .characteristicType = &kHAPCharacteristicType_Name,
+    .debugDescription = kHAPCharacteristicDebugDescription_Name,
+    .properties = TLV8_PROPS(true, false, false),
+    .constraints = { .maxLength = 64 },
+    .callbacks = { .handleRead = HandleServiceNameRead },
+};
+
+static const HAPStringCharacteristic echoConfiguredNameCharacteristic = {
+    .format = kHAPCharacteristicFormat_String,
+    .iid = kIID_EchoSwitchConfiguredName,
+    .characteristicType = &kCharType_ConfiguredName,
+    .debugDescription = "configured-name",
+    .properties = TLV8_PROPS(true, true, true),
+    .constraints = { .maxLength = 64 },
+    .callbacks = { .handleRead = HandleServiceNameRead, .handleWrite = HandleServiceNameWrite },
+};
+
+static const HAPService echoSwitchService = {
+    .iid = kIID_EchoSwitch,
+    .serviceType = &kHAPServiceType_Switch,
+    .debugDescription = kHAPServiceDebugDescription_Switch,
+    .name = "Echo Cancellation",
+    .properties = { .primaryService = false, .hidden = false, .ble = { .supportsConfiguration = false } },
+    .linkedServices = NULL,
+    .characteristics = (const HAPCharacteristic* const[]) { &echoOnCharacteristic, &echoNameCharacteristic,
+                                                               &echoConfiguredNameCharacteristic, NULL },
+};
+
+static void LoadEchoCancel(void) {
+    uint8_t b = 0;
+    size_t n = 0;
+    bool found = false;
+    if (!HAPPlatformKeyValueStoreGet(cam.keyValueStore, (HAPPlatformKeyValueStoreDomain) 0x00, kAppKVSKey_EchoCancel,
+                                     &b, 1, &n, &found) && found && n == 1)
+        talkback_set_echo_cancel(b != 0);
+}
 
 // Motion sensor: fed by rmd (debounced, with its cooldown) or rvd's raw IVS flag. StatusActive is false while
 // neither answers, so Home shows the sensor as not responding instead of "no motion".
@@ -891,6 +1300,26 @@ static const HAPBoolCharacteristic motionStatusActiveCharacteristic = {
     .callbacks = { .handleRead = HandleMotionStatusActiveRead },
 };
 
+static const HAPStringCharacteristic motionNameCharacteristic = {
+    .format = kHAPCharacteristicFormat_String,
+    .iid = kIID_MotionName,
+    .characteristicType = &kHAPCharacteristicType_Name,
+    .debugDescription = kHAPCharacteristicDebugDescription_Name,
+    .properties = TLV8_PROPS(true, false, false),
+    .constraints = { .maxLength = 64 },
+    .callbacks = { .handleRead = HandleServiceNameRead },
+};
+
+static const HAPStringCharacteristic motionConfiguredNameCharacteristic = {
+    .format = kHAPCharacteristicFormat_String,
+    .iid = kIID_MotionConfiguredName,
+    .characteristicType = &kCharType_ConfiguredName,
+    .debugDescription = "configured-name",
+    .properties = TLV8_PROPS(true, true, true),
+    .constraints = { .maxLength = 64 },
+    .callbacks = { .handleRead = HandleServiceNameRead, .handleWrite = HandleServiceNameWrite },
+};
+
 static const HAPService motionService = {
     .iid = kIID_Motion,
     .serviceType = &kHAPServiceType_MotionSensor,
@@ -900,6 +1329,8 @@ static const HAPService motionService = {
     .linkedServices = NULL,
     .characteristics = (const HAPCharacteristic* const[]) { &motionDetectedCharacteristic,
                                                             &motionStatusActiveCharacteristic,
+                                                            &motionNameCharacteristic,
+                                                            &motionConfiguredNameCharacteristic,
                                                             NULL },
 };
 
@@ -928,7 +1359,10 @@ static HAPAccessory accessory = {
                                               &hapProtocolInformationService,
                                               &pairingService,
                                               &cameraService,
+                                              &cameraService2,
                                               &microphoneService,
+                                              &speakerService,
+                                              &echoSwitchService,
                                               &motionService,
                                               &operatingModeService,
                                               &dataStreamService,
@@ -938,27 +1372,45 @@ static HAPAccessory accessory = {
 };
 
 static void Watchdog(HAPPlatformTimerRef timer HAP_UNUSED, void* _Nullable context HAP_UNUSED) {
-    if (cam.stream && stream_finished(cam.stream))
-        EndSession("stream thread ended");
+    for (int i = 0; i < kRtpSlots; i++)
+        if (cam.slot[i].stream && stream_finished(cam.slot[i].stream))
+            EndSession(&cam.slot[i], "stream thread ended");
     HAPError err = HAPPlatformTimerRegister(&cam.watchdog, HAPPlatformClockGetCurrent() + 2000, Watchdog, NULL);
     HAPAssert(!err);
 }
 
 static void HandleSessionInvalidate(HAPAccessoryServerRef* server HAP_UNUSED, HAPSessionRef* session, void* _Nullable ctx HAP_UNUSED) {
     hds_session_invalidated(session);
-    if (cam.stream && session == cam.streamSession)
-        EndSession("HAP session closed");
-    else if (!cam.stream && cam.haveSetup && session == cam.setupSession)
-        EndSession("HAP session closed before start");
+    for (int i = 0; i < kRtpSlots; i++) {
+        rtp_slot_t* s = &cam.slot[i];
+        if (s->stream && session == s->streamSession)
+            EndSession(s, "HAP session closed");
+        else if (!s->stream && s->haveSetup && session == s->setupSession)
+            EndSession(s, "HAP session closed before start");
+    }
 }
 
 void AppCreate(HAPAccessoryServerRef* server, HAPPlatformKeyValueStoreRef keyValueStore) {
     HAPRawBufferZero(&cam, sizeof cam);
     cam.server = server;
     cam.keyValueStore = keyValueStore;
-    cam.active = 1;
-    cam.streamingStatus = kStreamingStatus_Available;
-    cam.pending.videoSock = cam.pending.audioSock = -1;
+    static const HAPService* const services[kRtpSlots] = { &cameraService, &cameraService2 };
+    static const HAPCharacteristic* const status[kRtpSlots] = {
+        (const HAPCharacteristic*) &streamingStatusCharacteristic, (const HAPCharacteristic*) &streamingStatusCharacteristic2
+    };
+    static const HAPCharacteristic* const active[kRtpSlots] = {
+        (const HAPCharacteristic*) &activeCharacteristic, (const HAPCharacteristic*) &activeCharacteristic2
+    };
+    for (int i = 0; i < kRtpSlots; i++) {
+        rtp_slot_t* s = &cam.slot[i];
+        s->index = i;
+        s->service = services[i];
+        s->statusCharacteristic = status[i];
+        s->activeCharacteristic = active[i];
+        s->active = 1;
+        s->streamingStatus = kStreamingStatus_Available;
+        s->pending.videoSock = s->pending.audioSock = -1;
+    }
     const char* name = getenv("RHKD_NAME");
     if (name && *name)
         accessory.name = name;
@@ -969,11 +1421,13 @@ void AppCreate(HAPAccessoryServerRef* server, HAPPlatformKeyValueStoreRef keyVal
 }
 
 void AppRelease(void) {
-    EndSession("shutdown");
+    EndAllSessions("shutdown");
+    talkback_shutdown();
 }
 
 // Bump this whenever services or characteristics change, so controllers re-read /accessories.
-#define kDBRevision ((uint32_t) 7)
+#define kDBRevision ((uint32_t) 11) // 9: second RTP stream service, Echo Cancellation switch; 10: its Configured Name;
+                                     // 11: motion sensor Name + Configured Name
 #define kAppKVSDomain ((HAPPlatformKeyValueStoreDomain) 0x00)
 #define kAppKVSKey_DBRevision ((HAPPlatformKeyValueStoreKey) 0x01)
 
@@ -1010,7 +1464,7 @@ static void MotionChanged(bool motion, bool available) {
 // Runs on the HAP run loop when the camera is turned on or off in Home.
 static void OperatingModeChanged(bool homeKitActive) {
     if (!homeKitActive) {
-        EndSession("camera turned off in Home");
+        EndAllSessions("camera turned off in Home");
         recording_camera_disabled();
     }
     // StatusActive mirrors HomeKitCameraActive; StreamingStatus/SetupEndpoints reads change with it.
@@ -1019,6 +1473,8 @@ static void OperatingModeChanged(bool homeKitActive) {
 
 void AppAccessoryServerStart(void) {
     BumpConfigurationNumberIfDBChanged();
+    LoadEchoCancel();
+    LoadServiceNames();
     opmode_init(cam.server, cam.keyValueStore, OperatingModeChanged);
     recording_init(cam.server, cam.keyValueStore);
     hds_init(recording_hds_message, recording_hds_closed);

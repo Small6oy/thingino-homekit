@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "stream.h"
+#include "ringutil.h"
 #include "srtp.h"
+#include "talkback.h"
 #include "rss_ipc.h"
 
 #include <errno.h>
@@ -20,6 +22,12 @@
 static const HAPLogObject logObject = { .subsystem = "rhkd", .category = "Stream" };
 
 #define RTCP_TIMEOUT_MS 30000
+// Connected UDP (as the certified G100 does): an ICMP "port unreachable" from the controller comes back as
+// ECONNREFUSED on the next send/recv. A session ends when refusals keep coming for REFUSED_END_MS with no RTCP.
+#define REFUSED_END_MS 1000
+// A connected socket only accepts datagrams from the controller's advertised port. If no RTCP at all arrives in
+// this time, disconnect and fall back to unconnected sockets (in case a controller sends from another port).
+#define CONNECT_PROBATION_MS 10000
 #define SR_INTERVAL_MS 1000
 #define PKT_MAX 1600
 
@@ -29,7 +37,11 @@ struct stream {
     atomic_bool stop;
     atomic_bool finished;
     atomic_bool wantIdr;
+    atomic_bool paused; // Suspend from the controller: send no media, keep the session (RTCP) alive
     srtp_ctx_t srtp;
+    bool connected;                 // both sockets connect()ed to the controller
+    _Atomic uint64_t refusedSince;  // ms of the first ECONNREFUSED since the last RTCP (0: none)
+    _Atomic uint32_t refusedCount;
     uint16_t seq;
     uint32_t tsOffset;
     uint32_t lastRtpTs;
@@ -113,15 +125,23 @@ static void log_rtcp_reports(const char* what, const uint8_t* d, size_t len, uns
     }
 }
 
-// Drains a socket; returns true if anything arrived. Logs at most one report every 5 s.
-static bool drain_rtcp(int sock, srtp_ctx_t* srtp, const char* what, unsigned clockHz, uint64_t* lastLog) {
+// Drains a socket; returns true if anything arrived. Logs at most one report every 5 s. RTP on the socket (the
+// controller's audio for two-way audio) goes to @tb, if given.
+static bool drain_rtcp(int sock, srtp_ctx_t* srtp, const char* what, unsigned clockHz, uint64_t* lastLog,
+                       talkback_t* tb, bool* refused) {
     uint8_t rx[1500];
     bool any = false;
     ssize_t n;
     while ((n = recv(sock, rx, sizeof rx, MSG_DONTWAIT)) > 0) {
         any = true;
-        if (n < 8 || rx[1] < 200 || rx[1] > 204) // not RTCP
+        if (n < 8 || rx[1] < 200 || rx[1] > 204) { // not RTCP
+            if (tb && srtp && n >= 12 + SRTP_AUTH_TAG_LEN && (rx[0] & 0xC0) == 0x80) {
+                size_t plain = srtp_unprotect_rtp(srtp, rx, (size_t) n);
+                if (plain)
+                    talkback_rtp(tb, rx, plain);
+            }
             continue;
+        }
         size_t plain = srtp ? srtp_unprotect_rtcp(srtp, rx, (size_t) n) : 0;
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -131,6 +151,8 @@ static bool drain_rtcp(int sock, srtp_ctx_t* srtp, const char* what, unsigned cl
             log_rtcp_reports(what, rx, plain, clockHz);
         }
     }
+    if (n < 0 && errno == ECONNREFUSED && refused)
+        *refused = true;
     return any;
 }
 
@@ -140,12 +162,27 @@ static uint64_t now_ms(void) {
     return (uint64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+// Records an ECONNREFUSED (ICMP port unreachable from the controller) on either socket.
+static void note_refused(stream_t* s) {
+    uint64_t zero = 0;
+    atomic_compare_exchange_strong(&s->refusedSince, &zero, now_ms());
+    atomic_fetch_add(&s->refusedCount, 1);
+}
+
+// RTCP (or any datagram) from the controller: it's alive, forget earlier refusals.
+static void note_alive(stream_t* s) {
+    atomic_store(&s->refusedSince, 0);
+    atomic_store(&s->refusedCount, 0);
+}
+
 static void send_pkt(stream_t* s, uint8_t* pkt, size_t len) {
     size_t n = srtp_protect_rtp(&s->srtp, pkt, len);
     if (!n)
         return;
     if (sendto(s->p.videoSock, pkt, n, 0, (struct sockaddr*) &s->p.videoDst, s->p.videoDstLen) < 0) {
-        if (errno != EAGAIN && errno != ENOBUFS)
+        if (errno == ECONNREFUSED)
+            note_refused(s);
+        else if (errno != EAGAIN && errno != ENOBUFS)
             HAPLogError(&logObject, "sendto: %d", errno);
     }
     s->pktCount++;
@@ -384,7 +421,9 @@ static void send_audio_packet(stream_t* s, const uint8_t* payload, size_t len, u
     if (!n)
         return;
     if (sendto(s->p.audioSock, pkt, n, 0, (struct sockaddr*) &s->p.audioDst, s->p.audioDstLen) < 0) {
-        if (errno != EAGAIN && errno != ENOBUFS)
+        if (errno == ECONNREFUSED)
+            note_refused(s);
+        else if (errno != EAGAIN && errno != ENOBUFS)
             HAPLogError(&logObject, "audio sendto: %d", errno);
     }
     s->audioLastRtpTs = ts;
@@ -485,6 +524,7 @@ static void* audio_thread(void* arg) {
     }
     rss_ring_acquire(ring);
     const rss_ring_header_t* hdr = rss_ring_get_header(ring);
+    uint32_t ringInc = ring_incarnation(ring);
     // Only Opus can go out (HomeKit negotiates Opus; we don't transcode). With rad on AAC or PCM the frames would
     // be sent as Opus garbage, so stay silent and say why. 111 = RAD_CODEC_OPUS.
     if (hdr->codec != 111) {
@@ -496,6 +536,7 @@ static void* audio_thread(void* arg) {
         return NULL;
     }
     uint64_t readSeq = atomic_load(&hdr->write_seq) + 1;
+    talkback_t* tb = talkback_open(s->p.audioPayloadType); // two-way audio: the controller's Opus -> speaker
     unsigned wantSamples48 = (unsigned) s->p.audioPacketMs * 48;
     if (!wantSamples48)
         wantSamples48 = 960;
@@ -504,16 +545,53 @@ static void* audio_thread(void* arg) {
     uint32_t frames = 0;
     bool loggedToc = false;
 
-    uint64_t lastRrLog = 0;
+    uint64_t lastRrLog = 0, lastReopen = 0;
     while (!atomic_load(&s->stop)) {
-        if (drain_rtcp(s->p.audioSock, &s->audioSrtp, "audio", s->p.audioClockHz, &lastRrLog))
+        bool refused = false;
+        if (drain_rtcp(s->p.audioSock, &s->audioSrtp, "audio", s->p.audioClockHz, &lastRrLog, tb, &refused)) {
             atomic_store(&s->audioLastRx, now_ms());
+            note_alive(s);
+        }
+        if (refused)
+            note_refused(s);
+        // rad recreated the ring (restart): reopen without blocking, since this loop also carries talk-back.
+        if (ring && ring_recreated(ring, ringInc)) {
+            HAPLogInfo(&logObject, "audio ring %s restarted; reopening", s->p.audioRingName);
+            rss_ring_release(ring);
+            rss_ring_close(ring);
+            ring = NULL;
+        }
+        if (!ring) {
+            uint64_t t = now_ms();
+            if (t - lastReopen >= 500) {
+                lastReopen = t;
+                rss_ring_t* r = rss_ring_open(s->p.audioRingName);
+                if (r && rss_ring_version_ok(r, NULL) && rss_ring_get_header(r)->codec == 111 && !rss_ring_stale(r) &&
+                    rss_ring_max_frame_size(r) <= maxFrame) {
+                    ring = r;
+                    rss_ring_acquire(ring);
+                    hdr = rss_ring_get_header(ring);
+                    ringInc = ring_incarnation(ring);
+                    readSeq = atomic_load(&hdr->write_seq) + 1;
+                    s->audioHaveTs = false;
+                    agg.count = 0;
+                    agg.total = 0;
+                    agg.samples48 = 0;
+                } else if (r) {
+                    rss_ring_close(r);
+                }
+            }
+            if (!ring) {
+                usleep(20000);
+                continue;
+            }
+        }
         uint32_t len = 0;
         rss_ring_slot_t meta;
         int ret = rss_ring_read(ring, &readSeq, frame, maxFrame, &len, &meta);
         if (ret == -EAGAIN) {
             rss_ring_wait(ring, 100);
-        } else if (ret == RSS_EOVERFLOW) {
+        } else if (ret == RSS_EOVERFLOW && !ring_recreated(ring, ringInc)) { // recreated: reopened next pass
             readSeq = atomic_load(&hdr->write_seq);
             agg.count = 0;
             agg.total = 0;
@@ -527,7 +605,7 @@ static void* audio_thread(void* arg) {
                 HAPLogInfo(&logObject, "audio: first Opus frame toc=0x%02x (%u ms, code %u), packet time %u ms",
                            toc, fs / 48, toc & 3, (unsigned) s->p.audioPacketMs);
             }
-            if (atomic_load(&s->audioMuted)) {
+            if (atomic_load(&s->audioMuted) || atomic_load(&s->paused)) {
                 s->audioHaveTs = false;
                 agg.count = 0;
                 agg.total = 0;
@@ -572,9 +650,12 @@ static void* audio_thread(void* arg) {
         }
     }
     HAPLogInfo(&logObject, "audio ended after %u frames, %u packets", frames, s->audioPktCount);
-    rss_ring_release(ring);
+    talkback_close(tb);
+    if (ring) {
+        rss_ring_release(ring);
+        rss_ring_close(ring);
+    }
     free(frame);
-    rss_ring_close(ring);
     return NULL;
 }
 
@@ -606,31 +687,70 @@ static void* stream_thread(void* arg) {
     rss_ring_request_idr(ring);
 
     const rss_ring_header_t* hdr = rss_ring_get_header(ring);
+    uint32_t ringInc = ring_incarnation(ring);
     uint64_t readSeq = atomic_load(&hdr->write_seq) + 1;
     bool gotKey = false;
-    uint64_t start = now_ms(), lastRx = start, lastSr = 0, lastIdrReq = start, lastRrLog = 0;
+    uint64_t start = now_ms(), lastRx = start, lastSr = 0, lastIdrReq = start, lastRrLog = 0, pausedSince = 0;
+    bool gotRx = false; // anything from the controller yet (connected-socket probation)
     uint32_t frames = 0;
     HAPLogInfo(&logObject, "streaming %s (%ux%u requested) pt=%u mtu=%u", s->p.ringName, s->p.width, s->p.height,
                s->p.payloadType, s->p.mtu);
 
     while (!atomic_load(&s->stop)) {
         // Drain anything the controller sent (RTCP RR); it's our liveness signal.
-        if (drain_rtcp(s->p.videoSock, &s->srtp, "video", 90000, &lastRrLog))
+        bool refused = false;
+        if (drain_rtcp(s->p.videoSock, &s->srtp, "video", 90000, &lastRrLog, NULL, &refused)) {
             lastRx = now_ms();
+            gotRx = true;
+            note_alive(s);
+        }
+        if (refused)
+            note_refused(s);
         if (!s->audioThreadStarted) { // otherwise the audio thread drains its own socket
             uint8_t rx[1500];
-            while (recv(s->p.audioSock, rx, sizeof rx, MSG_DONTWAIT) > 0)
+            ssize_t an;
+            while ((an = recv(s->p.audioSock, rx, sizeof rx, MSG_DONTWAIT)) > 0) {
                 lastRx = now_ms();
+                gotRx = true;
+                note_alive(s);
+            }
+            if (an < 0 && errno == ECONNREFUSED)
+                note_refused(s);
         } else {
             uint64_t a = atomic_load(&s->audioLastRx);
-            if (a > lastRx)
+            if (a > lastRx) {
                 lastRx = a;
+                gotRx = true;
+            }
         }
 
         uint64_t now = now_ms();
+        // A suspended session may go quiet (the controller ends it explicitly), but not for more than 5 minutes,
+        // so a controller that vanished while suspended doesn't keep the camera busy.
+        if (!atomic_load(&s->paused))
+            pausedSince = 0;
+        else if (!pausedSince)
+            pausedSince = now;
+        else if (now - pausedSince < 300000)
+            lastRx = now;
         if (now - lastRx > RTCP_TIMEOUT_MS) {
             HAPLogInfo(&logObject, "no RTCP from controller for %u ms, ending stream", RTCP_TIMEOUT_MS);
             break;
+        }
+        uint64_t refusedSince = atomic_load(&s->refusedSince);
+        if (refusedSince && now - refusedSince >= REFUSED_END_MS && atomic_load(&s->refusedCount) >= 2) {
+            HAPLogInfo(&logObject, "controller port unreachable (%u ICMP refusals in %llu ms, no RTCP), ending stream",
+                       (unsigned) atomic_load(&s->refusedCount), (unsigned long long) (now - refusedSince));
+            break;
+        }
+        if (s->connected && !gotRx && now - start > CONNECT_PROBATION_MS) {
+            struct sockaddr unspec = { .sa_family = AF_UNSPEC };
+            (void) connect(s->p.videoSock, &unspec, sizeof unspec);
+            (void) connect(s->p.audioSock, &unspec, sizeof unspec);
+            s->connected = false;
+            note_alive(s);
+            HAPLogInfo(&logObject, "no RTCP in %u ms on connected sockets; disconnected them (fallback)",
+                       CONNECT_PROBATION_MS);
         }
         if (atomic_exchange(&s->wantIdr, false) || (!gotKey && now - lastIdrReq > 1000)) {
             rss_ring_request_idr(ring);
@@ -644,12 +764,18 @@ static void* stream_thread(void* arg) {
             rss_ring_slot_t meta;
             int ret = rss_ring_read(ring, &readSeq, frame, maxFrame, &len, &meta);
             if (ret == RSS_EOVERFLOW) {
+                if (ring_recreated(ring, ringInc))
+                    break; // reopened below; retrying would spin on EOVERFLOW forever
                 readSeq = atomic_load(&hdr->write_seq);
                 gotKey = false;
                 continue;
             }
             if (ret != 0)
                 break;
+            if (atomic_load(&s->paused)) {
+                gotKey = false; // on resume, start again at a keyframe (requested in stream_set_paused)
+                continue;
+            }
             if (!gotKey) {
                 if (!meta.is_key)
                     continue;
@@ -659,6 +785,45 @@ static void* stream_thread(void* arg) {
             send_frame(s, frame, len, meta.timestamp);
             frames++;
         }
+        // rvd recreates a ring when it restarts that stream (aux resize, stream-restart, an rvd restart): follow it
+        // to the new one, starting again at a keyframe. Gives up (ends the session) if it doesn't come back in 5 s.
+        if (ring_recreated(ring, ringInc)) {
+            HAPLogInfo(&logObject, "ring %s restarted; reopening", s->p.ringName);
+            rss_ring_release(ring);
+            rss_ring_close(ring);
+            ring = NULL;
+            for (int tries = 0; tries < 50 && !atomic_load(&s->stop) && !ring; tries++) {
+                usleep(100000);
+                rss_ring_t* r = rss_ring_open(s->p.ringName);
+                if (r && rss_ring_version_ok(r, NULL) && rss_ring_get_header(r)->codec == 0 && !rss_ring_stale(r))
+                    ring = r;
+                else if (r)
+                    rss_ring_close(r);
+            }
+            if (!ring) {
+                HAPLogError(&logObject, "ring %s did not come back; ending stream", s->p.ringName);
+                break;
+            }
+            uint32_t m = rss_ring_max_frame_size(ring);
+            if (m > maxFrame) {
+                uint8_t* nf = realloc(frame, m);
+                if (!nf) {
+                    rss_ring_close(ring);
+                    ring = NULL;
+                    break;
+                }
+                frame = nf;
+                maxFrame = m;
+            }
+            rss_ring_acquire(ring);
+            rss_ring_request_idr(ring);
+            hdr = rss_ring_get_header(ring);
+            ringInc = ring_incarnation(ring);
+            readSeq = atomic_load(&hdr->write_seq) + 1;
+            gotKey = false;
+            lastIdrReq = start = now_ms(); // the next "first keyframe" log counts from the reopen
+            continue;
+        }
         now = now_ms();
         if (gotKey && now - lastSr >= SR_INTERVAL_MS) {
             send_rtcp_sr(s);
@@ -666,7 +831,8 @@ static void* stream_thread(void* arg) {
         }
     }
     HAPLogInfo(&logObject, "stream ended after %u frames, %u packets", frames, s->pktCount);
-    rss_ring_release(ring);
+    if (ring)
+        rss_ring_release(ring);
 out:
     free(frame);
     if (ring)
@@ -683,6 +849,22 @@ int stream_ring_codec(const char* ringName) {
     int codec = rss_ring_version_ok(r, NULL) ? (int) rss_ring_get_header(r)->codec : -1;
     rss_ring_close(r);
     return codec;
+}
+
+bool stream_ring_info(const char* ringName, stream_ring_info_t* info) {
+    rss_ring_t* r = rss_ring_open(ringName);
+    if (!r)
+        return false;
+    bool ok = rss_ring_version_ok(r, NULL);
+    if (ok) {
+        const rss_ring_header_t* h = rss_ring_get_header(r);
+        info->streamId = h->stream_id;
+        info->codec = h->codec;
+        info->width = h->width;
+        info->height = h->height;
+    }
+    rss_ring_close(r);
+    return ok;
 }
 
 // Marks a socket's traffic class so Wi-Fi (WMM) queues it accordingly: DSCP EF -> voice (AC_VO) for audio,
@@ -707,6 +889,15 @@ stream_t* stream_start(const stream_params_t* p) {
     set_traffic_class(s->p.audioSock, s->p.videoDst.ss_family, 46, 6); // EF, voice
     if (s->p.mtu < 400 || s->p.mtu > 1500)
         s->p.mtu = 1378;
+    // Connect both sockets to the controller (sendto with the same address still works on Linux).
+    s->connected = connect(s->p.videoSock, (struct sockaddr*) &s->p.videoDst, s->p.videoDstLen) == 0 &&
+                   connect(s->p.audioSock, (struct sockaddr*) &s->p.audioDst, s->p.audioDstLen) == 0;
+    if (!s->connected) {
+        struct sockaddr unspec = { .sa_family = AF_UNSPEC };
+        (void) connect(s->p.videoSock, &unspec, sizeof unspec);
+        (void) connect(s->p.audioSock, &unspec, sizeof unspec);
+        HAPLogInfo(&logObject, "could not connect the RTP sockets (%d); using unconnected sockets", errno);
+    }
     if (srtp_init(&s->srtp, p->videoKey, p->videoSalt)) {
         free(s);
         return NULL;
@@ -759,6 +950,14 @@ bool stream_finished(const stream_t* s) {
 void stream_set_audio_muted(stream_t* s, bool muted) {
     if (s)
         atomic_store(&s->audioMuted, muted);
+}
+
+void stream_set_paused(stream_t* s, bool paused) {
+    if (!s || atomic_exchange(&s->paused, paused) == paused)
+        return;
+    HAPLogInfo(&logObject, "stream %s", paused ? "suspended" : "resumed");
+    if (!paused)
+        atomic_store(&s->wantIdr, true);
 }
 
 void stream_request_idr(stream_t* s) {

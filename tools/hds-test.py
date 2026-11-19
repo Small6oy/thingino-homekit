@@ -13,6 +13,7 @@ usage (~/.venvs/aqara/bin/python):
   hds-test.py pair <pairing.json> <device-id> <setup-code>
   hds-test.py run  <pairing.json>
   hds-test.py record <pairing.json> <out.mp4> [seconds]   # select config, Active=1, record, save fMP4
+  hds-test.py talk <pairing.json> <opus.ogg> [--volume N] [--mute-after S]   # live view + two-way audio
 The test instance runs on the camera with RHKD_SERVICE_NAME=haptest and its own store, so it never
 touches the real accessory (see homekit.md "HDS test instance").
 """
@@ -398,6 +399,189 @@ async def cmd_record(path, out, seconds):
         return packets >= 2
 
 
+# --- two-way audio test: live-view session + SRTP Opus to the camera's audio port ------------------------------
+def srtp_session_keys(mk, ms):
+    """RFC 3711 4.3.1 (kdr 0): session encryption key, auth key and salt for SRTP."""
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    def derive(label, n):
+        iv = bytearray(ms) + b"\0\0"
+        iv[7] ^= label
+        enc = Cipher(algorithms.AES(mk), modes.CTR(bytes(iv))).encryptor()
+        return enc.update(b"\0" * n) + enc.finalize()
+
+    return derive(0, 16), derive(1, 20), derive(2, 14)
+
+
+def srtp_protect(keys, pkt, roc=0):
+    import hmac
+    import hashlib
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    ke, ka, ks = keys
+    seq = int.from_bytes(pkt[2:4], "big")
+    ssrc = int.from_bytes(pkt[8:12], "big")
+    index = (roc << 16) | seq
+    iv = bytearray(ks) + b"\0\0"
+    for i, b in enumerate(ssrc.to_bytes(4, "big")):
+        iv[4 + i] ^= b
+    for i, b in enumerate(index.to_bytes(6, "big")):
+        iv[8 + i] ^= b
+    enc = Cipher(algorithms.AES(ke), modes.CTR(bytes(iv))).encryptor()
+    out = pkt[:12] + enc.update(pkt[12:]) + enc.finalize()
+    tag = hmac.new(ka, out + roc.to_bytes(4, "big"), hashlib.sha1).digest()[:10]
+    return out + tag
+
+
+def ogg_packets(path):
+    """Opus packets from an Ogg file (skips OpusHead and OpusTags)."""
+    data, pos, cur, out = pathlib.Path(path).read_bytes(), 0, b"", []
+    while pos + 27 <= len(data) and data[pos:pos + 4] == b"OggS":
+        nseg = data[pos + 26]
+        segs = data[pos + 27:pos + 27 + nseg]
+        body = pos + 27 + nseg
+        for s in segs:
+            cur += data[body:body + s]
+            body += s
+            if s < 255:
+                out.append(cur)
+                cur = b""
+        pos = body
+    return [p for p in out if not p.startswith((b"OpusHead", b"OpusTags"))]
+
+
+async def cmd_talk(path, ogg, volume, mute_after, suspend_at=0, service=0, size="640x360", kbps=299,
+                   reconfigure_at=0, reconfigure_kbps=0, echo=None):
+    import socket
+    import time
+    pkts = ogg_packets(ogg)
+    async with controller_for(path) as ctl:
+        pairing = ctl.aliases[ALIAS]
+        conn = pairing.connection
+        accs = await pairing.list_accessories_and_characteristics()
+        iid, rtp_services = {}, []
+        for s in accs[0]["services"]:
+            if s["type"].upper()[:8] == "00000110":
+                rtp_services.append({c["type"].upper()[:8]: c["iid"] for c in s["characteristics"]})
+            for c in s["characteristics"]:
+                iid.setdefault((s["type"].upper()[:8], c["type"].upper()[:8]), c["iid"])
+        if ("00000113", "00000119") not in iid:
+            print("no Speaker service (two-way audio) on this accessory")
+            return False
+        spk_vol, spk_mute = iid[("00000113", "00000119")], iid[("00000113", "0000011A")]
+        print(f"{len(rtp_services)} RTP stream service(s); using #{service}")
+        if echo is not None:
+            sw = iid.get(("00000049", "00000025"))
+            print(f"echo cancellation switch -> {echo}:", await conn.put_json("/characteristics", {"characteristics": [
+                {"aid": 1, "iid": sw, "value": echo == "on"}]}) or "ok" if sw else "no switch")
+        setup_iid, sel_iid = rtp_services[service]["00000118"], rtp_services[service]["00000117"]
+        width, height = (int(v) for v in size.split("x"))
+        print("speaker volume ->", volume, await conn.put_json("/characteristics", {"characteristics": [
+            {"aid": 1, "iid": spk_vol, "value": volume}, {"aid": 1, "iid": spk_mute, "value": False}]}) or "ok")
+
+        cam_ip = pairing.pairing_data["AccessoryIP"]
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect((cam_ip, 9))
+        my_ip = probe.getsockname()[0]
+        probe.close()
+        vs, aus = (socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(2))
+        for s in (vs, aus):
+            s.bind((my_ip, 0))
+            s.setblocking(False)
+        vkey, vsalt, akey, asalt, sid = (os.urandom(n) for n in (16, 14, 16, 14, 16))
+        req = tlv((1, sid),
+                  (3, tlv((1, 0), (2, my_ip.encode()), (3, struct.pack("<H", vs.getsockname()[1])),
+                          (4, struct.pack("<H", aus.getsockname()[1])))),
+                  (4, tlv((1, 0), (2, vkey), (3, vsalt))), (5, tlv((1, 0), (2, akey), (3, asalt))))
+        await conn.put_json("/characteristics", {"characteristics": [
+            {"aid": 1, "iid": setup_iid, "value": base64.b64encode(req).decode()}]})
+        got = await conn.get_json(f"/characteristics?id=1.{setup_iid}")
+        val = base64.b64decode(got["characteristics"][0]["value"])
+        items, i = {}, 0
+        while i < len(val):
+            items[val[i]] = val[i + 2:i + 2 + val[i + 1]]
+            i += 2 + val[i + 1]
+        addr, j = {}, 0
+        while j < len(items[3]):
+            addr[items[3][j]] = items[3][j + 2:j + 2 + items[3][j + 1]]
+            j += 2 + items[3][j + 1]
+        cam_aport = int.from_bytes(addr[4], "little")
+        print(f"setup: status {items[2][0]}, camera audio port {cam_aport}")
+
+        my_assrc = int.from_bytes(os.urandom(4), "big")
+        sel = tlv(
+            (1, tlv((1, sid), (2, 1))),
+            (2, tlv((1, 0), (2, tlv((1, 0), (2, 0), (3, 0))),
+                    (3, tlv((1, struct.pack("<H", width)), (2, struct.pack("<H", height)), (3, 30))),
+                    (4, tlv((1, 99), (2, struct.pack("<I", 1)), (3, struct.pack("<H", kbps)),
+                            (4, struct.pack("<f", 0.5)), (5, struct.pack("<H", 1378)))))),
+            (3, tlv((1, 3), (2, tlv((1, 1), (2, 0), (3, 1), (4, 20))),
+                    (3, tlv((1, 110), (2, struct.pack("<I", my_assrc)), (3, struct.pack("<H", 24)),
+                            (4, struct.pack("<f", 5.0)), (6, 13))), (4, 0))))
+        print("start:", await conn.put_json("/characteristics", {"characteristics": [
+            {"aid": 1, "iid": sel_iid, "value": base64.b64encode(sel).decode()}]}) or "ok")
+
+        keys = srtp_session_keys(akey, asalt)
+        seq, ts, rx_v, rx_a = int.from_bytes(os.urandom(2), "big"), 0, 0, 0
+        vbytes, reconfigured, vb_mark = 0, False, (0.0, 0)
+        t0, muted = time.monotonic(), False
+        phase, phase_v = "before", {"before": 0, "suspended": 0, "resumed": 0}
+        for n, op in enumerate(pkts):
+            el = time.monotonic() - t0
+            if suspend_at and phase == "before" and el >= suspend_at:
+                phase = "suspended"
+                print("suspend:", await conn.put_json("/characteristics", {"characteristics": [
+                    {"aid": 1, "iid": sel_iid, "value": base64.b64encode(tlv((1, tlv((1, sid), (2, 2))))).decode()}]}) or "ok")
+                await asyncio.sleep(0.3)  # packets already in flight
+                for s in (vs, aus):
+                    with contextlib.suppress(BlockingIOError):
+                        while True:
+                            s.recv(2048)
+            elif phase == "suspended" and el >= suspend_at + 2:
+                phase = "resumed"
+                print("resume:", await conn.put_json("/characteristics", {"characteristics": [
+                    {"aid": 1, "iid": sel_iid, "value": base64.b64encode(tlv((1, tlv((1, sid), (2, 3))))).decode()}]}) or "ok")
+            if reconfigure_at and not reconfigured and el >= reconfigure_at:
+                reconfigured = True
+                rb = vbytes - vb_mark[1]
+                print(f"video before reconfigure: {rb * 8 / max(el - vb_mark[0], 0.1) / 1000:.0f} kbit/s")
+                vb_mark = (el, vbytes)
+                rc = tlv((1, tlv((1, sid), (2, 4))),
+                         (2, tlv((3, tlv((1, struct.pack("<H", width)), (2, struct.pack("<H", height)), (3, 30))),
+                                 (4, tlv((3, struct.pack("<H", reconfigure_kbps)),)))))
+                print(f"reconfigure -> {reconfigure_kbps} kbit/s:", await conn.put_json("/characteristics", {"characteristics": [
+                    {"aid": 1, "iid": sel_iid, "value": base64.b64encode(rc).decode()}]}) or "ok")
+            if mute_after and not muted and time.monotonic() - t0 >= mute_after:
+                muted = True
+                print("speaker mute ->", await conn.put_json("/characteristics", {"characteristics": [
+                    {"aid": 1, "iid": spk_mute, "value": True}]}) or "ok")
+            rtp = bytes([0x80, 110]) + seq.to_bytes(2, "big") + ts.to_bytes(4, "big") + my_assrc.to_bytes(4, "big") + op
+            aus.sendto(srtp_protect(keys, rtp), (cam_ip, cam_aport))
+            seq, ts = (seq + 1) & 0xFFFF, (ts + 320) & 0xFFFFFFFF
+            for s in (vs, aus):
+                with contextlib.suppress(BlockingIOError):
+                    while True:
+                        d = s.recv(2048)
+                        if s is vs:
+                            rx_v += 1
+                            vbytes += len(d)
+                            phase_v[phase] += 1
+                        else:
+                            rx_a += 1
+            await asyncio.sleep(max(0, t0 + (n + 1) * 0.02 - time.monotonic()))
+        print(f"sent {len(pkts)} Opus packets; received {rx_v} video and {rx_a} audio packets from the camera")
+        el = time.monotonic() - t0
+        print(f"video {'after reconfigure' if reconfigured else 'overall'}: "
+              f"{(vbytes - vb_mark[1]) * 8 / max(el - vb_mark[0], 0.1) / 1000:.0f} kbit/s")
+        if suspend_at:
+            print("video packets per phase:", phase_v)
+        end = tlv((1, tlv((1, sid), (2, 0))))
+        print("end:", await conn.put_json("/characteristics", {"characteristics": [
+            {"aid": 1, "iid": sel_iid, "value": base64.b64encode(end).decode()}]}) or "ok")
+        await conn.put_json("/characteristics", {"characteristics": [{"aid": 1, "iid": spk_mute, "value": False},
+                                                                     {"aid": 1, "iid": spk_vol, "value": 100}]})
+        return rx_v > 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -411,7 +595,22 @@ def main():
     rc.add_argument("file")
     rc.add_argument("out")
     rc.add_argument("seconds", type=float, nargs="?", default=12)
+    tk = sub.add_parser("talk")
+    tk.add_argument("file")
+    tk.add_argument("ogg", help="Opus in Ogg, 20 ms frames (e.g. ffmpeg ... -c:a libopus -frame_duration 20)")
+    tk.add_argument("--volume", type=int, default=1, help="Speaker volume during the test (default 1: quiet)")
+    tk.add_argument("--mute-after", type=float, default=0, help="seconds after which Speaker Mute is set")
+    tk.add_argument("--suspend-at", type=float, default=0, help="Suspend the session at S seconds, Resume 2 s later")
+    tk.add_argument("--service", type=int, default=0, help="which Camera RTP Stream Management service (0, 1)")
+    tk.add_argument("--size", default="640x360", help="requested video size, e.g. 1280x720")
+    tk.add_argument("--kbps", type=int, default=299, help="requested max video bitrate")
+    tk.add_argument("--reconfigure-at", type=float, default=0, help="send Reconfigure at S seconds")
+    tk.add_argument("--reconfigure-kbps", type=int, default=0, help="max bitrate in that Reconfigure")
+    tk.add_argument("--echo", choices=["on", "off"], help="set the Echo Cancellation switch first")
     a = ap.parse_args()
+    if a.cmd == "talk":
+        sys.exit(0 if asyncio.run(cmd_talk(a.file, a.ogg, a.volume, a.mute_after, a.suspend_at, a.service,
+                                                     a.size, a.kbps, a.reconfigure_at, a.reconfigure_kbps, a.echo)) else 1)
     if a.cmd == "record":
         sys.exit(0 if asyncio.run(cmd_record(a.file, a.out, a.seconds)) else 1)
     if a.cmd == "pair":

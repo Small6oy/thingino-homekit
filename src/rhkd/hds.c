@@ -24,6 +24,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -153,6 +154,37 @@ static int SendFrame(hds_conn_t* c, const uint8_t* hdr, size_t hdrLen, const uin
     return ret;
 }
 
+// Bytes on the connection's socket that the controller has not acknowledged yet (Linux SIOCOUTQ = TIOCOUTQ:
+// unsent + unacked). -1 if the connection is gone.
+static long Unacked(hds_conn_t* c) {
+    int n = -1;
+    pthread_mutex_lock(&c->txLock);
+    if (c->used && !c->closing && c->fd >= 0 && ioctl(c->fd, TIOCOUTQ, &n) != 0)
+        n = -1;
+    pthread_mutex_unlock(&c->txLock);
+    return n;
+}
+
+int hds_wait_unacked(hds_conn_t* c, size_t maxBytes, unsigned timeoutMs, unsigned* waitedMs) {
+    uint64_t start = NowMs();
+    for (;;) {
+        long n = Unacked(c);
+        if (n < 0)
+            return -1;
+        uint64_t waited = NowMs() - start;
+        if ((size_t) n <= maxBytes) {
+            if (waitedMs)
+                *waitedMs += (unsigned) waited;
+            return 0;
+        }
+        if (waited >= timeoutMs) {
+            HAPLogError(&logObject, "HDS connection %d: %ld bytes unacknowledged after %u ms", c->fd, n, timeoutMs);
+            return -1;
+        }
+        usleep(10 * 1000);
+    }
+}
+
 static const uint8_t kEmptyDict[] = { 0xE0 };
 
 int hds_send_response(hds_conn_t* c, const char* protocol, const char* topic, int64_t id, int status,
@@ -235,6 +267,14 @@ static void CloseConn(hds_conn_t* c, const char* why) {
     if (c->ready && hds.onClosed)
         hds.onClosed(c);
     pthread_mutex_lock(&c->txLock);
+    // Graceful close (as the ADK's HAPPlatformTCPStreamCloseOutput): FIN after what's already queued, then read
+    // away what the controller sent but we didn't read. Linux answers close() with unread received data by RST,
+    // which discards our unsent tail (e.g. a final dataSend/close).
+    (void) shutdown(c->fd, SHUT_WR);
+    uint8_t drain[512];
+    int guard = 64;
+    while (guard-- > 0 && recv(c->fd, drain, sizeof drain, MSG_DONTWAIT) > 0) {
+    }
     close(c->fd);
     c->fd = -1;
     c->used = false;

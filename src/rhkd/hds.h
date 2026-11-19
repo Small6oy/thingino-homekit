@@ -47,6 +47,13 @@ int hds_send_request(hds_conn_t* conn, const char* protocol, const char* topic, 
                      size_t msgLen);
 void hds_close(hds_conn_t* conn);
 
+// Back-pressure for bulk sends (HKSV fragments): waits until at most @maxBytes sent on @conn are still
+// unacknowledged by the controller, as the commercial ADK checks HAPPlatformTCPStreamGetNumNonAcknowledgedBytes
+// before writing. Keeps the backlog in rhkd's queue (where old GOPs can be dropped) instead of the kernel's send
+// buffer, so a slow link doesn't queue seconds of recording ahead of live RTP. Adds the time waited to *waitedMs.
+// Returns 0, or -1 if the connection closed or @timeoutMs passed.
+int hds_wait_unacked(hds_conn_t* conn, size_t maxBytes, unsigned timeoutMs, unsigned* waitedMs);
+
 // Largest payload one frame can carry (24-bit length, as HAP-NodeJS limits it).
 #define HDS_MAX_PAYLOAD 0xFFFFF
 

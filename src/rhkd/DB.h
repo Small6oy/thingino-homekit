@@ -25,7 +25,7 @@ extern "C" {
 /**
  * Total number of services and characteristics contained in the accessory.
  */
-#define kAttributeCount ((size_t) 30) // info 9 + protocol 3 + pairing 5 + camera 8 + microphone 2 + motion 3
+#define kAttributeCount ((size_t) 65) // info 9 + protocol 3 + pairing 5 + camera 8 + camera2 8 + microphone 2 + speaker 3 + echo switch 4 + motion 5 + operating mode 7 + data stream 4 + recording 7
 
 /**
  * HomeKit Accessory Information service.

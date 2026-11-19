@@ -128,6 +128,50 @@ size_t srtp_protect_rtcp(srtp_ctx_t* c, uint8_t* buf, size_t len) {
     return len + SRTP_AUTH_TAG_LEN;
 }
 
+// RFC 3711 3.3.1 / Appendix A: estimate the packet's rollover counter from the highest sequence number seen.
+size_t srtp_unprotect_rtp(srtp_ctx_t* c, uint8_t* buf, size_t len) {
+    if (len < 12 + SRTP_AUTH_TAG_LEN)
+        return 0;
+    size_t authLen = len - SRTP_AUTH_TAG_LEN;
+    size_t hdr = 12 + 4 * (buf[0] & 0x0F);
+    if (buf[0] & 0x10) {
+        if (authLen < hdr + 4)
+            return 0;
+        hdr += 4 + 4 * ((buf[hdr + 2] << 8) | buf[hdr + 3]);
+    }
+    if (authLen < hdr)
+        return 0;
+    uint16_t seq = (uint16_t)((buf[2] << 8) | buf[3]);
+    uint32_t v = c->rxRoc;
+    if (c->rxHaveSeq) {
+        if (c->rxLastSeq < 0x8000) {
+            if (seq - c->rxLastSeq > 0x8000 && v > 0)
+                v--; // a late packet from before the last wrap
+        } else if (c->rxLastSeq - 0x8000 > seq) {
+            v++; // the sequence number wrapped
+        }
+    }
+    uint8_t roc[4] = { (uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t) v };
+    uint8_t tag[SRTP_AUTH_TAG_LEN];
+    auth(&c->rtp, buf, authLen, roc, 4, tag);
+    uint8_t diff = 0;
+    for (size_t i = 0; i < SRTP_AUTH_TAG_LEN; i++)
+        diff |= (uint8_t)(tag[i] ^ buf[authLen + i]);
+    if (diff)
+        return 0;
+    uint32_t ssrc = ((uint32_t) buf[8] << 24) | ((uint32_t) buf[9] << 16) | ((uint32_t) buf[10] << 8) | buf[11];
+    uint8_t iv[16];
+    make_iv(iv, c->rtp.salt, ssrc, ((uint64_t) v << 16) | seq);
+    aes_cm(&c->rtp.aes, iv, buf + hdr, authLen - hdr);
+    // Only an authenticated packet moves the state forward.
+    if (!c->rxHaveSeq || v > c->rxRoc || (v == c->rxRoc && (uint16_t)(seq - c->rxLastSeq) < 0x8000)) {
+        c->rxRoc = v;
+        c->rxLastSeq = seq;
+        c->rxHaveSeq = 1;
+    }
+    return authLen;
+}
+
 size_t srtp_unprotect_rtcp(srtp_ctx_t* c, uint8_t* buf, size_t len) {
     if (len < 8 + SRTCP_TRAILER_LEN)
         return 0;

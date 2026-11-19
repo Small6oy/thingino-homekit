@@ -26,7 +26,10 @@ RHKD_MOTION_HOLD_SEC=10
 # Audio RTP clock: empty = the sample rate iOS negotiates (16/24 kHz), or 48000 (RFC 7587).
 RHKD_AUDIO_CLOCK=
 
-# While Home is viewing from the sub stream, its bitrate follows what iOS asks for (never above the configured
-# value, never below RHKD_MIN_BITRATE_KBPS) and is restored afterwards. main is never changed.
+# While Home is viewing from the sub or aux stream, its bitrate follows what iOS asks for (never above the
+# configured value) and is restored afterwards. main is never changed. Floors: sub is shared with other readers
+# (e.g. Frigate's detect stream), so it stays at least RHKD_MIN_BITRATE_KBPS; aux only feeds HomeKit and follows
+# iOS down to RHKD_MIN_AUX_BITRATE_KBPS.
 RHKD_ADAPT_BITRATE=true
 RHKD_MIN_BITRATE_KBPS=300
+RHKD_MIN_AUX_BITRATE_KBPS=100

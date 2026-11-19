@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "snapshot.h"
 #include "rss_ipc.h"
+#include "ringutil.h"
 #include <errno.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -28,6 +29,7 @@ size_t snapshot_take(const char* ringName, uint8_t* out, size_t cap, unsigned ti
     const rss_ring_header_t* hdr = rss_ring_get_header(ring);
     rss_ring_acquire(ring); // demand wakes the JPEG encoder
     uint64_t seq = atomic_load(&hdr->write_seq) + 1;
+    uint32_t inc = ring_incarnation(ring);
     uint64_t start = now_ms();
     while (now_ms() - start < timeoutMs) {
         // Read first, wait only on -EAGAIN (the raptor rad/ringdump pattern): waiting first can
@@ -40,6 +42,10 @@ size_t snapshot_take(const char* ringName, uint8_t* out, size_t cap, unsigned ti
             continue;
         }
         if (ret == RSS_EOVERFLOW) {
+            if (ring_recreated(ring, inc)) {
+                HAPLogInfo(&logObject, "%s was recreated during the snapshot; giving up", ringName);
+                break; // every read would overflow until the timeout
+            }
             seq = atomic_load(&hdr->write_seq);
             continue;
         }
