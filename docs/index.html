@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="How rhkd, the native HomeKit daemon for Thingino cameras, connects Apple Home to raptor's video and audio rings.">
+<title>rhkd HomeKit Architecture</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; }
+/* Layout: one wide canvas (Apple side → rhkd → raptor rings → raptor daemons → hardware), detail panel below. */
+:root {
+  --bg: #f4f5f3; --panel: #ffffff; --ink: #1b1f22; --muted: #5d666c; --line: #d5d9d6; --frame: #eef0ed;
+  --net: #b4590f; --video: #0e7268; --audio: #6a3fc4; --ctl: #6b7780; --apple: #26292c;
+  --font: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #131618; --panel: #1b1f22; --ink: #e7eae8; --muted: #9aa3a8; --line: #343b40; --frame: #171b1d;
+    --net: #f0a160; --video: #4fc7b8; --audio: #b597f5; --ctl: #8e9aa2; --apple: #e7eae8; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #131618; --panel: #1b1f22; --ink: #e7eae8; --muted: #9aa3a8; --line: #343b40; --frame: #171b1d;
+  --net: #f0a160; --video: #4fc7b8; --audio: #b597f5; --ctl: #8e9aa2; --apple: #e7eae8; color-scheme: dark;
+}
+body { background: var(--bg); color: var(--ink); font: 15px/1.55 var(--font); }
+.wrap { max-width: 1400px; margin: 0 auto; padding-block: 28px 48px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+h1 { font-size: 26px; font-weight: 700; margin: 0 0 4px; letter-spacing: -.01em; text-wrap: balance; }
+.lede { color: var(--muted); max-width: 70ch; margin: 0 0 12px; }
+.lede a, .note a { color: var(--video); }
+.note { max-width: 80ch; margin: 0 0 16px; padding: 10px 14px; border: 1px solid var(--line); border-left: 3px solid var(--net); border-radius: 6px; background: var(--panel); font-size: 14px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; color: var(--muted); margin: 0 0 12px; }
+.legend span { display: inline-flex; align-items: center; gap: 7px; }
+.legend i { display: inline-block; width: 22px; height: 0; border-top: 2px solid; }
+.legend i.dash { border-top-style: dashed; }
+.stage { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+canvas { display: block; cursor: default; }
+.hint { font-size: 13px; color: var(--muted); margin: 8px 0 0; }
+.detail { margin-top: 16px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; max-width: 80ch; min-height: 96px; }
+.detail .kicker { font: 500 12px/1.4 var(--mono); color: var(--muted); letter-spacing: .04em; text-transform: uppercase; }
+.detail h2 { font-size: 18px; margin: 0; }
+.detail p { margin: 0; }
+.detail code, .mono { font: 13px/1.4 var(--mono); }
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px 24px; margin-top: 28px; }
+.facts div { min-width: 0; }
+.facts h3 { font-size: 14px; margin: 0 0 4px; }
+.facts p { margin: 0; color: var(--muted); font-size: 14px; }
+</style>
+
+</head>
+<body>
+<div class="wrap">
+  <h1>rhkd HomeKit Architecture</h1>
+  <p class="lede">How rhkd, the native HomeKit daemon for <a href="https://github.com/themactep/thingino-firmware">Thingino</a> cameras, turns raptor's shared-memory rings into live view, snapshots, talk-back, motion and HomeKit Secure Video. Tested on the Wyze Cam v3 (T31X) and v4 (T41NQ).</p>
+  <p class="note"><strong>Development line.</strong> This page shows rhkd 0.9.7. The released code in this repository is 0.7.7; the <span class="mono">aux</span> live stream, two live viewers, talk-back with the echo-cancellation switch and recording send-pacing arrive with the next release. <a href="https://github.com/Small6oy/thingino-homekit">Source on GitHub</a>.</p>
+  <div class="legend" aria-label="Line types">
+    <span><i style="border-color:var(--net)"></i>Network to Apple devices</span>
+    <span><i style="border-color:var(--video)"></i>Video</span>
+    <span><i style="border-color:var(--audio)"></i>Audio</span>
+    <span><i class="dash" style="border-color:var(--ctl)"></i>Control sockets</span>
+  </div>
+  <div class="stage" id="stage"><canvas id="cv" role="img" aria-label="Architecture diagram: Apple Home devices talk HAP, SRTP and HomeKit Data Stream to rhkd on the camera; rhkd reads raptor's video and audio rings and controls rvd and rad over their sockets."></canvas></div>
+  <p class="hint">Tap or hover a box to highlight its connections and name the protocol on each. On a phone, scroll the diagram sideways.</p>
+  <section class="detail" id="detail" aria-live="polite"></section>
+
+  <div class="facts">
+    <div><h3>One process, no bridge</h3><p>rhkd is a static mipsel binary built on Apple's HomeKitADK with mbedTLS. Home talks to the camera directly; nothing like Scrypted or Homebridge runs in between.</p></div>
+    <div><h3>Encoders only run when watched</h3><p>The <span class="mono">aux</span> video stream and the <span class="mono">audio2</span>/<span class="mono">audio3</span> outputs start when rhkd opens their ring and stop a few seconds after the last reader leaves.</p></div>
+    <div><h3>No transcoding on the camera</h3><p>Live view takes Opus from <span class="mono">audio2</span>, recordings take AAC from <span class="mono">audio3</span>. The Opus to AAC fallback is only needed when rad offers no AAC output, and can be compiled out (<span class="mono">TRANSCODE=0</span>).</p></div>
+    <div><h3>Per camera</h3><p>v4 (T41NQ): main 2560×1440, aux up to 1920×1080 at 2.5 Mbit/s. v3 (T31X): main 1920×1080 capped at 2 Mbit/s, aux up to 1280×720.</p></div>
+  </div>
+</div>
+
+<script>
+(() => {
+const W = 1420, H = 880;
+const N = {}; // nodes by id
+function node(id, x, y, w, h, title, sub, o = {}) { N[id] = { id, x, y, w, h, title, sub, ...o }; }
+
+// Apple side
+node('homeapp', 24, 96, 184, 92, 'Home app', 'iPhone · iPad · Mac', { kind: 'apple',
+  info: ['Apple device', 'Home app', 'Pairs with the camera, shows live view and snapshots, sends talk-back audio. It finds the camera over Bonjour (_hap._tcp) and then speaks HAP over TCP; live media goes over SRTP on UDP.'] });
+node('hub', 24, 372, 184, 92, 'Home hub', 'Apple TV · HomePod', { kind: 'apple',
+  info: ['Apple device', 'Home hub', 'Runs HomeKit Secure Video: it receives motion events, pulls fMP4 recordings from the camera over HomeKit Data Stream, analyses them and uploads the clips.'] });
+node('icloud', 24, 612, 184, 72, 'iCloud', 'HKSV clips, end-to-end encrypted', { kind: 'apple',
+  info: ['Apple service', 'iCloud', 'Stores the recordings the hub uploads. The camera never talks to iCloud.'] });
+
+// rhkd modules
+const MX = 388, MW = 324;
+node('hap', MX, 82, MW, 92, 'HAP core', 'HomeKitADK (patched) · mbedTLS 2.28 · pairing store /etc/homekit', { kind: 'mod',
+  info: ['rhkd module', 'HAP core', 'Apple\'s HomeKitADK with our patches, linked statically with mbedTLS 2.28 and raptor-ipc. Handles pairing, encrypted sessions and characteristic reads, writes and events. Our platform layer advertises the service by writing /run/hap.service for the camera\'s mdnsd and sending it SIGHUP.'] });
+node('db', MX, 188, MW, 78, 'Accessory database', '2× RTP stream · mic · speaker · motion · operating mode · recording · data stream · echo switch', { kind: 'mod',
+  info: ['rhkd module · camera.c', 'Accessory database', 'Two Camera RTP Stream Management services (two live viewers), Microphone, Speaker, Motion Sensor, Camera Operating Mode, Camera Recording Management, DataStream Transport Management and an Echo Cancellation switch. Database revision 11.'] });
+node('live', MX, 280, MW, 86, 'Live view', 'SRTP · per-session bitrate · keyframe on demand · 2 viewers', { kind: 'mod',
+  info: ['rhkd modules · stream.c, srtp.c, bitrate.c', 'Live view', 'Each session reads the on-demand aux ring (sub as fallback) and Opus from audio2, packs RTP, encrypts with SRTP and sends over connected UDP sockets. It asks rvd for the bitrate iOS requests and for a keyframe when a viewer joins.'] });
+node('snap', MX, 380, MW, 56, 'Snapshots', 'JPEG from the jpeg1 ring', { kind: 'mod',
+  info: ['rhkd module · snapshot.c', 'Snapshots', 'Answers Home\'s snapshot requests with the latest frame from jpeg1. jpeg0 (full size) is not used: on the T41 its ring is too small (raptor #57).'] });
+node('talk', MX, 450, MW, 72, 'Talk-back', 'Opus → PCM 16 kHz · echo cancellation while talking', { kind: 'mod',
+  info: ['rhkd module · talkback.c', 'Talk-back', 'Decrypts the Opus audio iOS sends, decodes it with libopus and writes 16 kHz PCM into rad\'s speaker ring. The first session to talk holds the speaker. It switches rad\'s echo cancellation on during talk-back unless it is already enabled in raptor.conf.'] });
+node('motion', MX, 536, MW, 56, 'Motion', 'rvd motion detection, rmd as fallback', { kind: 'mod',
+  info: ['rhkd module · motion.c', 'Motion', 'Polls rvd\'s motion detection over its control socket, falling back to rmd\'s state, and raises the Motion Sensor event that starts a HomeKit Secure Video recording on the hub.'] });
+node('rec', MX, 606, MW, 100, 'HKSV recorder', 'fMP4 fragments · prebuffer · HomeKit Data Stream with back-pressure (≤256 KB unacknowledged)', { kind: 'mod',
+  info: ['rhkd modules · recorder.c, fmp4.c, hds.c, opack.c', 'HKSV recorder', 'Keeps a prebuffer of H.264 from main and AAC-LC from audio3 (or audio), cuts fMP4 fragments and streams them to the hub over HomeKit Data Stream. It paces sends by the socket\'s unacknowledged bytes so a weak uplink is not flooded.'] });
+node('aacpipe', MX, 720, MW, 56, 'Opus → AAC fallback', 'optional · TRANSCODE=0 leaves it out', { kind: 'mod', off: true,
+  info: ['rhkd module · aacpipe.c', 'Opus → AAC fallback', 'Converts Opus to AAC with libopus and faac when rad offers no AAC ring. Supports faac 1.x, 2.x and 3.0. Can be left out with TRANSCODE=0 when rad already publishes AAC.'] });
+
+// rings
+const RX = 812, RW = 176;
+const ring = (id, y, sub, kind, info) => node(id, RX, y, RW, 54, id, sub, { kind, ring: true, info: ['raptor ring · /dev/shm', id, info] });
+ring('main', 84, 'H.264 · 1440p / 1080p', 'video', 'Main video stream. rhkd records HKSV from it; rsd serves it to Frigate over RTSP.');
+ring('sub', 148, 'H.264 · low resolution', 'video', 'Sub stream. Live view falls back to it when there is no aux stream.');
+ring('aux', 212, 'H.264 · on demand', 'video', 'Third encoder ([stream2]) that runs only while read, sized for HomeKit: up to 1080p at 2.5 Mbit/s on the v4, 720p on the v3. Lingers 5 s after the last reader.');
+ring('jpeg1', 276, 'JPEG snapshots', 'video', 'Snapshot ring for the sub resolution; rhkd answers snapshot requests from it.');
+ring('audio', 380, 'AAC-LC 16 kHz', 'audio', 'rad\'s main audio output, always on. RTSP and Frigate use it; the recorder falls back to it.');
+ring('audio2', 444, 'Opus · on demand', 'audio', 'Extra rad output (raptor #88), encoded only while read. Live-view audio.');
+ring('audio3', 508, 'AAC 32k · on demand', 'audio', 'Extra rad output (raptor #88) at a recording bitrate. HKSV audio.');
+ring('speaker', 600, 'PCM in → speaker', 'audio', 'rad plays whatever PCM arrives here. Written by rhkd for talk-back and by rsd for RTSP backchannel.');
+
+// raptor daemons
+const DX = 1074, DW = 158;
+node('rvd', DX, 118, DW, 128, 'rvd', 'video: ISP, H.264 and JPEG encoders, motion detection', { kind: 'daemon',
+  info: ['raptor daemon', 'rvd', 'Drives the sensor and ISP, runs the H.264 and JPEG encoders and motion detection, and publishes main, sub, aux and jpeg rings. Control socket /var/run/rss/rvd.sock.'] });
+node('rad', DX, 404, DW, 156, 'rad', 'audio in and out: AAC (faac), Opus, echo cancellation', { kind: 'daemon',
+  info: ['raptor daemon', 'rad', 'Captures the mic once and encodes up to three outputs (audio, audio2, audio3), and plays the speaker ring. On faac 2.2 today; raptor #92 moves it to faac 3.0. Control socket /var/run/rss/rad.sock.'] });
+node('rmd', DX, 606, DW, 54, 'rmd', 'motion state', { kind: 'daemon',
+  info: ['raptor daemon', 'rmd', 'Raptor\'s motion daemon. rhkd reads its state only when rvd\'s motion detection does not answer.'] });
+node('mdnsd', DX, 680, DW, 54, 'mdnsd', 'Bonjour for the camera', { kind: 'daemon',
+  info: ['Thingino daemon', 'mdnsd', 'troglobit mdnsd advertises every service file in /etc/mdns.d. rhkd adds _hap._tcp through /run/hap.service and a SIGHUP.'] });
+node('rsd', DX, 756, DW, 74, 'rsd · rwd', 'RTSP · WebRTC', { kind: 'daemon', other: true,
+  info: ['other ring readers', 'rsd and rwd', 'Not part of HomeKit, shown because they share the rings: rsd serves RTSP to NVRs such as Frigate, rwd serves WebRTC in the browser.'] });
+
+// hardware
+const HX = 1284, HW = 114;
+node('sensor', HX, 138, HW, 88, 'Sensor', 'ISP · gc2053 / os04d10', { kind: 'hw',
+  info: ['hardware', 'Image sensor and ISP', 'v3: GalaxyCore gc2053 on an Ingenic T31X. v4: OmniVision os04d10 on an Ingenic T41NQ.'] });
+node('mic', HX, 414, HW, 56, 'Mic', '', { kind: 'hw', info: ['hardware', 'Microphone', 'Captured by rad at 16 kHz.'] });
+node('spk', HX, 494, HW, 56, 'Speaker', '', { kind: 'hw', info: ['hardware', 'Speaker', 'Played by rad from the speaker ring.'] });
+
+const GROUPS = [
+  { x: 352, y: 18, w: 1058, h: 850, label: 'Camera · Thingino firmware · Wyze Cam v3 (T31X) and v4 (T41NQ)', camera: true },
+  { x: 368, y: 46, w: 364, h: 746, label: 'rhkd 0.9.7' },
+  { x: 796, y: 46, w: 208, h: 620, label: 'raptor rings · shared memory' },
+  { x: 1056, y: 46, w: 194, h: 800, label: 'daemons' },
+  { x: 1268, y: 46, w: 142, h: 520, label: 'hardware' },
+];
+
+// edges: [from, to, kind, label, opts]
+const E = [
+  ['homeapp', 'hap', 'net', 'HAP over TCP · found via Bonjour', { both: true }],
+  ['hub', 'hap', 'net', 'HAP over TCP', { both: true }],
+  ['live', 'homeapp', 'net', 'SRTP over UDP: H.264 + Opus'],
+  ['homeapp', 'talk', 'net', 'SRTP: Opus talk-back'],
+  ['snap', 'homeapp', 'net', 'JPEG over HAP'],
+  ['motion', 'hub', 'net', 'motion event'],
+  ['rec', 'hub', 'net', 'HomeKit Data Stream: fMP4 (H.264 + AAC)'],
+  ['hub', 'icloud', 'net', 'encrypted clips'],
+  ['aux', 'live', 'video', 'per-session video'],
+  ['sub', 'live', 'video', 'fallback', { dash: true }],
+  ['jpeg1', 'snap', 'video', ''],
+  ['main', 'rec', 'video', 'HKSV video'],
+  ['audio2', 'live', 'audio', 'Opus'],
+  ['audio3', 'rec', 'audio', 'AAC'],
+  ['audio', 'rec', 'audio', 'fallback', { dash: true }],
+  ['talk', 'speaker', 'audio', 'PCM'],
+  ['rvd', 'main', 'video', ''], ['rvd', 'sub', 'video', ''], ['rvd', 'aux', 'video', ''], ['rvd', 'jpeg1', 'video', ''],
+  ['rad', 'audio', 'audio', ''], ['rad', 'audio2', 'audio', ''], ['rad', 'audio3', 'audio', ''], ['speaker', 'rad', 'audio', ''],
+  ['sensor', 'rvd', 'video', ''], ['mic', 'rad', 'audio', ''], ['rad', 'spk', 'audio', ''],
+  ['main', 'rsd', 'video', 'RTSP / WebRTC', { other: true }], ['audio', 'rsd', 'audio', '', { other: true }],
+  ['live', 'rvd', 'ctl', 'set-bitrate · keyframe'],
+  ['talk', 'rad', 'ctl', 'set-aec'],
+  ['rvd', 'motion', 'ctl', 'motion state'],
+  ['rmd', 'motion', 'ctl', 'fallback'],
+  ['hap', 'mdnsd', 'ctl', '/run/hap.service + SIGHUP'],
+].map(([a, b, kind, label, o = {}]) => ({ a: N[a], b: N[b], kind, label, ...o }));
+
+// ports: spread edge ends along each node side, ordered by the other end's height
+const side = (n, other) => (other.x + other.w / 2 >= n.x + n.w / 2 ? 'r' : 'l');
+const ports = {};
+for (const e of E) {
+  e.sa = side(e.a, e.b); e.sb = side(e.b, e.a);
+  (ports[e.a.id + e.sa] ||= []).push({ e, end: 'a', o: e.b });
+  (ports[e.b.id + e.sb] ||= []).push({ e, end: 'b', o: e.a });
+}
+for (const k in ports) {
+  const list = ports[k].sort((p, q) => (p.o.y + p.o.h / 2) - (q.o.y + q.o.h / 2));
+  list.forEach((p, i) => {
+    const n = p.end === 'a' ? p.e.a : p.e.b, s = p.end === 'a' ? p.e.sa : p.e.sb;
+    const pt = { x: s === 'r' ? n.x + n.w : n.x, y: n.y + n.h * (i + 1) / (list.length + 1), s };
+    p.e[p.end === 'a' ? 'pa' : 'pb'] = pt;
+  });
+}
+
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d'), stage = document.getElementById('stage');
+let scale = 1, hover = null, pinned = null;
+const tok = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+function resize() {
+  const cw = Math.max(stage.clientWidth, 980);
+  scale = cw / W;
+  const dpr = window.devicePixelRatio || 1;
+  cv.style.width = cw + 'px'; cv.style.height = Math.round(H * scale) + 'px';
+  cv.width = Math.round(cw * dpr); cv.height = Math.round(H * scale * dpr);
+  ctx.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
+  draw();
+}
+
+function wrap(text, maxW) {
+  const words = text.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w;
+    if (ctx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur); return lines;
+}
+
+function curve(e) {
+  const a = e.pa, b = e.pb, dx = Math.max(40, Math.abs(b.x - a.x) * 0.45);
+  const c1 = { x: a.x + (a.s === 'r' ? dx : -dx), y: a.y }, c2 = { x: b.x + (b.s === 'r' ? dx : -dx), y: b.y };
+  return [a, c1, c2, b];
+}
+const bez = ([p0, p1, p2, p3], t) => {
+  const u = 1 - t;
+  return { x: u*u*u*p0.x + 3*u*u*t*p1.x + 3*u*t*t*p2.x + t*t*t*p3.x, y: u*u*u*p0.y + 3*u*u*t*p1.y + 3*u*t*t*p2.y + t*t*t*p3.y };
+};
+function arrow(p, from, color) {
+  const ang = Math.atan2(p.y - from.y, p.x - from.x), s = 7;
+  ctx.fillStyle = color; ctx.beginPath(); ctx.moveTo(p.x, p.y);
+  ctx.lineTo(p.x - s * Math.cos(ang - 0.42), p.y - s * Math.sin(ang - 0.42));
+  ctx.lineTo(p.x - s * Math.cos(ang + 0.42), p.y - s * Math.sin(ang + 0.42)); ctx.closePath(); ctx.fill();
+}
+
+function draw() {
+  const C = { bg: tok('--bg'), panel: tok('--panel'), ink: tok('--ink'), muted: tok('--muted'), line: tok('--line'),
+    frame: tok('--frame'), net: tok('--net'), video: tok('--video'), audio: tok('--audio'), ctl: tok('--ctl'), apple: tok('--apple') };
+  const sans = tok('--font'), mono = tok('--mono');
+  ctx.clearRect(0, 0, W, H); ctx.fillStyle = C.panel; ctx.fillRect(0, 0, W, H);
+  const focus = pinned || hover;
+  const linked = e => !focus || e.a === focus || e.b === focus;
+  const lit = n => !focus || n === focus || E.some(e => linked(e) && (e.a === n || e.b === n));
+
+  for (const g of GROUPS) {
+    ctx.save(); ctx.setLineDash(g.camera ? [6, 5] : []);
+    ctx.fillStyle = g.camera ? 'transparent' : C.frame; ctx.strokeStyle = C.line; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.roundRect(g.x, g.y, g.w, g.h, 10); if (!g.camera) ctx.fill(); ctx.stroke(); ctx.restore();
+    ctx.fillStyle = C.muted; ctx.font = `500 11px ${mono}`; ctx.textBaseline = 'alphabetic';
+    ctx.fillText(g.label.toUpperCase(), g.x + 12, g.y + (g.camera ? 18 : 20));
+  }
+
+  // edges, dimmed first then lit on top
+  const order = [...E].sort((p, q) => linked(p) - linked(q));
+  for (const e of order) {
+    const on = linked(e), col = C[e.kind], pts = curve(e);
+    ctx.save(); ctx.globalAlpha = on ? (e.other && !focus ? 0.45 : 1) : 0.12;
+    ctx.strokeStyle = col; ctx.lineWidth = on && focus ? 2.2 : 1.5;
+    ctx.setLineDash(e.kind === 'ctl' || e.dash ? [5, 4] : []);
+    ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y); ctx.bezierCurveTo(pts[1].x, pts[1].y, pts[2].x, pts[2].y, pts[3].x, pts[3].y); ctx.stroke();
+    ctx.setLineDash([]); arrow(pts[3], bez(pts, 0.93), col); if (e.both) arrow(pts[0], bez(pts, 0.07), col);
+    ctx.restore();
+  }
+  // labels: network edges always, the rest when their box is focused
+  for (const e of E) {
+    if (!e.label || !focus || !linked(e)) continue;
+    const p = bez(curve(e), e.kind === 'net' ? 0.5 : 0.5);
+    ctx.font = `500 11px ${sans}`; const tw = ctx.measureText(e.label).width;
+    ctx.fillStyle = C.panel; ctx.globalAlpha = 0.94; ctx.beginPath(); ctx.roundRect(p.x - tw / 2 - 6, p.y - 9, tw + 12, 18, 9); ctx.fill();
+    ctx.globalAlpha = 1; ctx.strokeStyle = C[e.kind]; ctx.lineWidth = 1; ctx.stroke();
+    ctx.fillStyle = C.ink; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(e.label, p.x, p.y + 0.5); ctx.textAlign = 'left';
+  }
+
+  for (const n of Object.values(N)) {
+    const on = lit(n); ctx.save(); ctx.globalAlpha = on ? (n.off || (n.other && !focus) ? 0.6 : 1) : 0.25;
+    const accent = n.kind === 'apple' ? C.apple : n.ring ? C[n.kind] : n.kind === 'hw' ? C.muted : n.kind === 'daemon' ? C.ink : C.net;
+    ctx.fillStyle = C.panel; ctx.strokeStyle = n === focus ? accent : C.line; ctx.lineWidth = n === focus ? 2 : 1;
+    ctx.setLineDash(n.off ? [4, 3] : []);
+    ctx.beginPath(); ctx.roundRect(n.x, n.y, n.w, n.h, n.ring ? 6 : 8); ctx.fill(); ctx.stroke(); ctx.setLineDash([]);
+    if (n.ring || n.kind === 'mod') { ctx.fillStyle = n.ring ? C[n.kind] : C.net; ctx.fillRect(n.x + 1, n.y + 8, 3, n.h - 16); }
+    const pad = 14;
+    ctx.fillStyle = C.ink; ctx.textBaseline = 'top';
+    ctx.font = n.ring ? `500 14px ${mono}` : `600 ${n.kind === 'daemon' ? 17 : 15}px ${n.kind === 'daemon' ? mono : sans}`;
+    ctx.fillText(n.title, n.x + pad, n.y + (n.ring ? 9 : 12));
+    if (n.sub) { ctx.font = `400 12px ${sans}`; ctx.fillStyle = C.muted;
+      wrap(n.sub, n.w - pad * 2).forEach((l, i) => ctx.fillText(l, n.x + pad, n.y + (n.ring ? 29 : 34) + i * 16)); }
+    ctx.restore();
+  }
+}
+
+function at(ev) {
+  const r = cv.getBoundingClientRect(), x = (ev.clientX - r.left) / scale, y = (ev.clientY - r.top) / scale;
+  return Object.values(N).find(n => x >= n.x && x <= n.x + n.w && y >= n.y && y <= n.y + n.h) || null;
+}
+const detail = document.getElementById('detail');
+const esc = s => s.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+function show(n) {
+  if (!n) { detail.innerHTML = '<div class="kicker">Start here</div><h2>Follow one feature end to end</h2><p>Live view: <span class="mono">rvd</span> → <span class="mono">aux</span> + <span class="mono">rad</span> → <span class="mono">audio2</span> → Live view → Home app. Recording: motion → hub, then <span class="mono">main</span> + <span class="mono">audio3</span> → HKSV recorder → hub → iCloud. Tap a box for details.</p>'; return; }
+  const [k, t, p] = n.info; detail.innerHTML = `<div class="kicker">${esc(k)}</div><h2>${esc(t)}</h2><p>${esc(p)}</p>`;
+}
+cv.addEventListener('mousemove', ev => { const n = at(ev); cv.style.cursor = n ? 'pointer' : 'default';
+  if (n !== hover) { hover = n; draw(); if (!pinned) show(n); } });
+cv.addEventListener('mouseleave', () => { hover = null; draw(); if (!pinned) show(null); });
+cv.addEventListener('click', ev => { const n = at(ev); pinned = n && n !== pinned ? n : null; draw(); show(pinned || n); });
+
+new ResizeObserver(resize).observe(stage);
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', draw);
+new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+document.fonts?.ready.then(draw);
+show(null); resize();
+})();
+</script>
+</body>
+</html>

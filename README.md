@@ -9,6 +9,9 @@ from Thingino's raptor streamer (`rvd`, `rad`) through its shared-memory rings, 
 the camera. Recording audio is AAC-LC from one of rad's AAC outputs, or, if rad only has Opus, converted from Opus
 on the camera.
 
+**Architecture:** an interactive diagram of how rhkd connects Apple Home to raptor's rings and daemons is at
+<https://small6oy.github.io/thingino-homekit/> (it shows the development line, ahead of this release).
+
 ## What works
 
 - **Pairing:** with the setup code or QR code from the camera's web UI (**Services → HomeKit**). Pairings are
