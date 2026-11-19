@@ -62,7 +62,8 @@ struct aacpipe {
     uint8_t* out;
 };
 
-// AAC-LC, MPEG-4, mono, raw frames (the MP4 carries the config in esds), no TNS or mid/side, 16-bit input.
+// AAC-LC, MPEG-4, mono, raw frames (the MP4 carries the config in esds), 16-bit input. TNS on with faac 3.x
+// (it gates TNS per frame, so it costs nothing measurable when it doesn't help), off with 2.x.
 static bool OpenEncoder(aacpipe_t* p, uint32_t sampleRate, uint32_t bitrate) {
 #if FAAC_V2
     faac_params prm;
@@ -75,7 +76,7 @@ static bool OpenEncoder(aacpipe_t* p, uint32_t sampleRate, uint32_t bitrate) {
     prm.channels = 1;
     prm.object_type = FAAC_OBJ_LC;
     prm.stereo_mode = FAAC_STEREO_LR;
-    prm.flags = FAAC_FLAG_PNS; // TNS off, PNS on, as before
+    prm.flags = FAAC_FLAG_TNS | FAAC_FLAG_PNS;
     prm.bit_rate = bitrate;    // whole-stream; mono
     prm.stream_format = FAAC_STREAM_RAW;
 #else

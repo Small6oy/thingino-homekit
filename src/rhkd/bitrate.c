@@ -4,9 +4,11 @@
 #include "rss_ipc.h"
 #include "stream.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "HAP.h"
@@ -14,16 +16,27 @@
 static const HAPLogObject logObject = { .subsystem = "rhkd", .category = "Bitrate" };
 
 #define RVD_SOCK "/var/run/rss/rvd.sock"
-#define SAVE_FILE "/run/rhkd-bitrate" // "<channel> <bps>" per lowered channel: the originals (survive an rhkd crash)
+#define SAVE_FILE "/run/rhkd-bitrate" // per lowered channel: "<channel> <orig bps> <section> <temporary bps>..."
+#define RAPTOR_CONF "/etc/raptor.conf"  // RHKD_RAPTOR_CONF overrides (tests)
+#define RAPTORCTL "/usr/bin/raptorctl"
+#define MAX_APPLIED 8
 
 // One entry per ring rhkd may lower ("sub", "aux").
+// rvd's set-bitrate also stores the value in its in-memory config, so a `raptorctl config save` (e.g. from the web UI)
+// during a live view writes the temporary bitrate into raptor.conf, and the next restart starts from it. rhkd remembers
+// the temporary values it set and, after restoring the encoder, puts the configured value back in the file if the file
+// holds one of them. A value the owner chose (not one of ours) is left alone.
 static struct {
     const char* ring;
-    int owner;         // session slot that set it, -1 if untouched
-    int chn;           // rvd channel (the ring's stream_id)
-    unsigned origBps;  // bitrate before we touched it
-    unsigned curBps;   // what we last set
-} gRings[] = { { "sub", -1, -1, 0, 0 }, { "aux", -1, -1, 0, 0 } };
+    const char* section;  // raptor.conf section of the ring's stream
+    int owner;            // session slot that set it, -1 if untouched
+    int chn;              // rvd channel (the ring's stream_id)
+    unsigned origBps;     // bitrate before we touched it
+    unsigned curBps;      // what we last set
+    unsigned applied[MAX_APPLIED]; // temporary values set this session (oldest replaced when full)
+    unsigned nApplied;
+} gRings[] = { { .ring = "sub", .section = "stream1", .owner = -1, .chn = -1 },
+               { .ring = "aux", .section = "stream2", .owner = -1, .chn = -1 } };
 
 static bool Enabled(void) {
     const char* v = getenv("RHKD_ADAPT_BITRATE");
@@ -76,7 +89,10 @@ static void Save(void) {
             continue;
         if (!f && !(f = fopen(SAVE_FILE, "w")))
             return;
-        fprintf(f, "%d %u\n", gRings[i].chn, gRings[i].origBps);
+        fprintf(f, "%d %u %s", gRings[i].chn, gRings[i].origBps, gRings[i].section);
+        for (unsigned k = 0; k < gRings[i].nApplied; k++)
+            fprintf(f, " %u", gRings[i].applied[k]);
+        fputc('\n', f);
     }
     if (f)
         fclose(f);
@@ -84,19 +100,118 @@ static void Save(void) {
         unlink(SAVE_FILE);
 }
 
+static void NoteApplied(size_t i, unsigned bps) {
+    for (unsigned k = 0; k < gRings[i].nApplied; k++)
+        if (gRings[i].applied[k] == bps)
+            return;
+    if (gRings[i].nApplied < MAX_APPLIED) {
+        gRings[i].applied[gRings[i].nApplied++] = bps;
+    } else {
+        memmove(gRings[i].applied, gRings[i].applied + 1, (MAX_APPLIED - 1) * sizeof gRings[i].applied[0]);
+        gRings[i].applied[MAX_APPLIED - 1] = bps;
+    }
+}
+
+static const char* ConfPath(void) {
+    const char* p = getenv("RHKD_RAPTOR_CONF");
+    return p && *p ? p : RAPTOR_CONF;
+}
+
+// The last `bitrate = N` in [section] of raptor.conf (as raptor's own parser, later keys win).
+static bool FileBitrate(const char* section, unsigned* bps) {
+    FILE* f = fopen(ConfPath(), "r");
+    if (!f)
+        return false;
+    char line[256];
+    bool inSect = false, found = false;
+    size_t slen = strlen(section);
+    while (fgets(line, sizeof line, f)) {
+        char* p = line;
+        while (isspace((unsigned char) *p))
+            p++;
+        if (*p == '[') {
+            inSect = strncmp(p + 1, section, slen) == 0 && p[1 + slen] == ']';
+            continue;
+        }
+        if (!inSect || strncmp(p, "bitrate", 7) != 0)
+            continue;
+        p += 7;
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (*p++ != '=')
+            continue;
+        char* end;
+        unsigned long v = strtoul(p, &end, 10);
+        if (end != p && v > 0) {
+            *bps = (unsigned) v;
+            found = true;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+static int SetFileBitrate(const char* section, unsigned bps) {
+    if (getenv("RHKD_RAPTOR_CONF")) { // tests: no raptorctl, write nothing but report
+        HAPLogInfo(&logObject, "(test) would set [%s] bitrate = %u", section, bps);
+        return 0;
+    }
+    char value[16];
+    snprintf(value, sizeof value, "%u", bps);
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl(RAPTORCTL, "raptorctl", "config", "set", section, "bitrate", value, (char*) NULL);
+        _exit(127);
+    }
+    int st = 0;
+    if (pid < 0 || waitpid(pid, &st, 0) != pid)
+        return -1;
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
+}
+
+// After a session: if raptor.conf holds one of the temporary values, a config save caught it; put @origBps back.
+static void RepairFile(const char* section, unsigned origBps, const unsigned* applied, unsigned nApplied) {
+    unsigned fileBps;
+    if (!section || !FileBitrate(section, &fileBps) || fileBps == origBps)
+        return;
+    bool ours = false;
+    for (unsigned k = 0; k < nApplied; k++)
+        ours |= applied[k] == fileBps;
+    if (!ours)
+        return; // the owner changed it; not ours to undo
+    if (SetFileBitrate(section, origBps) == 0)
+        HAPLogInfo(&logObject, "raptor.conf [%s] had the live view's temporary bitrate %u (a config save during the "
+                   "session); set it back to %u.", section, fileBps, origBps);
+    else
+        HAPLogError(&logObject, "raptor.conf [%s] has the live view's temporary bitrate %u; could not set it back to %u.",
+                    section, fileBps, origBps);
+}
+
 void bitrate_recover(void) {
     FILE* f = fopen(SAVE_FILE, "r");
     if (!f)
         return;
-    int chn = -1;
-    unsigned bps = 0;
-    while (fscanf(f, "%d %u", &chn, &bps) == 2) {
-        if (chn < 0 || !bps)
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        int chn = -1, n = 0;
+        unsigned bps = 0;
+        char section[32] = "";
+        if (sscanf(line, "%d %u %31s%n", &chn, &bps, section, &n) < 2 || chn < 0 || !bps)
             continue;
         if (SetBitrate(chn, bps) == 0)
             HAPLogInfo(&logObject, "Restored channel %d to %u bit/s (left lowered by a previous run).", chn, bps);
         else
             HAPLogError(&logObject, "Could not restore channel %d to %u bit/s.", chn, bps);
+        unsigned applied[MAX_APPLIED], nApplied = 0;
+        for (char* p = line + n; nApplied < MAX_APPLIED;) {
+            char* end;
+            unsigned long v = strtoul(p, &end, 10);
+            if (end == p)
+                break;
+            applied[nApplied++] = (unsigned) v;
+            p = end;
+        }
+        RepairFile(section[0] ? section : NULL, bps, applied, nApplied);
     }
     fclose(f);
     unlink(SAVE_FILE);
@@ -122,6 +237,7 @@ void bitrate_apply(int owner, const char* ringName, unsigned maxKbps) {
         gRings[i].owner = owner;
         gRings[i].chn = (int) info.streamId;
         gRings[i].curBps = gRings[i].origBps;
+        gRings[i].nApplied = 0;
         Save();
     }
     unsigned floorKbps = MinKbps(gRings[i].ring);
@@ -135,6 +251,10 @@ void bitrate_apply(int owner, const char* ringName, unsigned maxKbps) {
         HAPLogInfo(&logObject, "%s: %u -> %u bit/s (iOS asks max %u kbit/s, configured %u).", ringName,
                    gRings[i].curBps, bps, maxKbps, gRings[i].origBps);
         gRings[i].curBps = bps;
+        if (bps != gRings[i].origBps) {
+            NoteApplied(i, bps);
+            Save();
+        }
     } else {
         HAPLogError(&logObject, "set-bitrate on %s (channel %d) failed.", ringName, gRings[i].chn);
     }
@@ -151,6 +271,8 @@ void bitrate_release(int owner) {
             else
                 HAPLogError(&logObject, "Could not restore %s to %u bit/s.", gRings[i].ring, gRings[i].origBps);
         }
+        RepairFile(gRings[i].section, gRings[i].origBps, gRings[i].applied, gRings[i].nApplied);
+        gRings[i].nApplied = 0;
         gRings[i].owner = gRings[i].chn = -1;
         changed = true;
     }
