@@ -41,7 +41,7 @@ RIPC_SRCS := $(SRC)/raptor-ipc/src/rss_ring.c $(SRC)/raptor-ipc/src/rss_ipc_log.
 # 16 kHz output. TRANSCODE=0 drops aacpipe.c and faac: recordings then need one of rad's AAC rings
 # ("audio3"/"audio"/"audio2"), which stock Thingino audio provides. Camera dev builds use 0 (docker-build.sh); the
 # default stays 1 until rhkd-setup configures rad's outputs itself (todo.md).
-# SYSTEM_AUDIO=1 links the system libopus (and libfaac, faac >= 2 API, as Thingino's packages ship them) instead of
+# SYSTEM_AUDIO=1 links the system libopus (and libfaac, faac >= 3.0, as Thingino's packages ship them) instead of
 # building the bundled copies; AUDIO_CFLAGS points at their headers (opus.h is in include/opus).
 TRANSCODE ?= 1
 SYSTEM_AUDIO ?= 0

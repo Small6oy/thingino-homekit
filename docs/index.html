@@ -107,7 +107,7 @@ node('motion', MX, 536, MW, 56, 'Motion', 'rvd motion detection, rmd as fallback
 node('rec', MX, 606, MW, 100, 'HKSV recorder', 'fMP4 fragments · prebuffer · HomeKit Data Stream with back-pressure (≤256 KB unacknowledged)', { kind: 'mod',
   info: ['rhkd modules · recorder.c, fmp4.c, hds.c, opack.c', 'HKSV recorder', 'Keeps a prebuffer of H.264 from main and AAC-LC from audio3 (or audio), cuts fMP4 fragments and streams them to the hub over HomeKit Data Stream. It paces sends by the socket\'s unacknowledged bytes so a weak uplink is not flooded.'] });
 node('aacpipe', MX, 720, MW, 56, 'Opus → AAC fallback', 'optional · TRANSCODE=0 leaves it out', { kind: 'mod', off: true,
-  info: ['rhkd module · aacpipe.c', 'Opus → AAC fallback', 'Converts Opus to AAC with libopus and faac when rad offers no AAC ring. Supports faac 1.x, 2.x and 3.0. Can be left out with TRANSCODE=0 when rad already publishes AAC.'] });
+  info: ['rhkd module · aacpipe.c', 'Opus → AAC fallback', 'Converts Opus to AAC with libopus and faac when rad offers no AAC ring. Supports the bundled faac 1.30 and faac >= 3.0. Can be left out with TRANSCODE=0 when rad already publishes AAC.'] });
 
 // rings
 const RX = 812, RW = 176;
@@ -126,7 +126,7 @@ const DX = 1074, DW = 158;
 node('rvd', DX, 118, DW, 128, 'rvd', 'video: ISP, H.264 and JPEG encoders, motion detection', { kind: 'daemon',
   info: ['raptor daemon', 'rvd', 'Drives the sensor and ISP, runs the H.264 and JPEG encoders and motion detection, and publishes main, sub, aux and jpeg rings. Control socket /var/run/rss/rvd.sock.'] });
 node('rad', DX, 404, DW, 156, 'rad', 'audio in and out: AAC (faac), Opus, echo cancellation', { kind: 'daemon',
-  info: ['raptor daemon', 'rad', 'Captures the mic once and encodes up to three outputs (audio, audio2, audio3), and plays the speaker ring. On faac 2.2 today; raptor #92 moves it to faac 3.0. Control socket /var/run/rss/rad.sock.'] });
+  info: ['raptor daemon', 'rad', 'Captures the mic once and encodes up to three outputs (audio, audio2, audio3), and plays the speaker ring. Encodes with faac 3.0 on Thingino master; raptor #92 also moves its AAC decoding to libfaad3. Control socket /var/run/rss/rad.sock.'] });
 node('rmd', DX, 606, DW, 54, 'rmd', 'motion state', { kind: 'daemon',
   info: ['raptor daemon', 'rmd', 'Raptor\'s motion daemon. rhkd reads its state only when rvd\'s motion detection does not answer.'] });
 node('mdnsd', DX, 680, DW, 54, 'mdnsd', 'Bonjour for the camera', { kind: 'daemon',

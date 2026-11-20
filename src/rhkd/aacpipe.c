@@ -5,9 +5,9 @@
 // while faac runs. faac 1.30 is double precision, so the binary's FP ABI must match the SoC (T41: FP64/NAN2008 via
 // SOC=xburst2 builds); an FP32 build broke on T41 worker threads (homekit.md "faac off the main thread").
 //
-// faac versions: the bundled faac 1.30 (legacy faacEnc* API) or faac >= 2 (faac_encoder_* API, as Thingino's faac
-// package ships it), picked by FAAC_VERSION_MAJOR, which only faac >= 2's header defines. faac 3.0 (ABI 3) renamed
-// the faac_params fields and made bit_rate whole-stream; for mono the value is the same.
+// faac versions: the bundled faac 1.30 (legacy faacEnc* API) or faac >= 3.0 (faac_encoder_* ABI 3, as Thingino's
+// faac package ships it), picked by FAAC_VERSION_MAJOR, which only faac >= 2's header defines. faac 2.x (the first
+// faac_encoder_* API, with different faac_params fields) is not supported any more.
 //
 // Timing: the first PCM sample takes the packet's capture time; after that samples are counted, so AAC frames are
 // exactly 1024 samples apart. faac's priming delay (1024 samples in both versions: output k starts at input sample
@@ -24,15 +24,12 @@
 #include "faac.h"
 #include "opus.h"
 
-#if defined(FAAC_VERSION_MAJOR) && FAAC_VERSION_MAJOR >= 2
-#define FAAC_V2 1
-#else
-#define FAAC_V2 0
-#endif
 #if defined(FAAC_VERSION_MAJOR) && FAAC_VERSION_MAJOR >= 3
-#define AACPIPE_OBJ_LC FAAC_OBJ_LC
+#define FAAC_V3 1
+#elif defined(FAAC_VERSION_MAJOR)
+#error "faac 2.x is not supported: use faac >= 3.0 (SYSTEM_AUDIO=1) or the bundled faac 1.30"
 #else
-#define AACPIPE_OBJ_LC FAAC_OBJ_LOW
+#define FAAC_V3 0
 #endif
 
 #define MAX_OPUS_SAMPLES 5760 // 120 ms at 48 kHz: the largest Opus packet, at any decode rate
@@ -41,7 +38,7 @@
 
 struct aacpipe {
     OpusDecoder* dec;
-#if FAAC_V2
+#if FAAC_V3
     faac_encoder* enc;
     const uint8_t* asc; // owned by the encoder
 #else
@@ -63,37 +60,27 @@ struct aacpipe {
 };
 
 // AAC-LC, MPEG-4, mono, raw frames (the MP4 carries the config in esds), 16-bit input. TNS on with faac 3.x
-// (it gates TNS per frame, so it costs nothing measurable when it doesn't help), off with 2.x.
+// (it gates TNS per frame, so it costs nothing measurable when it doesn't help), off with 1.30.
 static bool OpenEncoder(aacpipe_t* p, uint32_t sampleRate, uint32_t bitrate) {
-#if FAAC_V2
+#if FAAC_V3
     faac_params prm;
     if (faac_params_init(&prm, sizeof prm) != FAAC_OK)
         return false;
     prm.sample_rate = sampleRate;
     prm.bandwidth = 0;
     prm.input_format = FAAC_INPUT_16BIT;
-#if FAAC_VERSION_MAJOR >= 3
     prm.channels = 1;
     prm.object_type = FAAC_OBJ_LC;
     prm.stereo_mode = FAAC_STEREO_LR;
     prm.flags = FAAC_FLAG_TNS | FAAC_FLAG_PNS;
-    prm.bit_rate = bitrate;    // whole-stream; mono
+    prm.bit_rate = bitrate; // whole-stream; mono
     prm.stream_format = FAAC_STREAM_RAW;
-#else
-    prm.num_channels = 1;
-    prm.mpeg_version = FAAC_MPEG4;
-    prm.object_type = FAAC_OBJ_LOW;
-    prm.joint_mode = FAAC_JOINT_NONE;
-    prm.use_tns = false;
-    prm.bit_rate = bitrate; // per channel; mono
-    prm.output_format = FAAC_STREAM_RAW;
-#endif
     if (faac_encoder_open(&prm, &p->enc) != FAAC_OK)
         return false;
     faac_encoder_info info = { .struct_size = sizeof info };
     uint32_t ascLen = 0;
     if (faac_encoder_get_info(p->enc, &info) != FAAC_OK || info.frame_samples != AACPIPE_FRAME_SAMPLES ||
-        info.object_type != AACPIPE_OBJ_LC || faac_encoder_asc(p->enc, &p->asc, &ascLen) != FAAC_OK)
+        info.object_type != FAAC_OBJ_LC || faac_encoder_asc(p->enc, &p->asc, &ascLen) != FAAC_OK)
         return false;
     p->maxOut = info.max_output_bytes;
     p->delay = info.encoder_delay;
@@ -142,7 +129,7 @@ void aacpipe_close(aacpipe_t* p) {
         return;
     if (p->dec)
         opus_decoder_destroy(p->dec);
-#if FAAC_V2
+#if FAAC_V3
     faac_encoder_close(&p->enc);
 #else
     if (p->enc)
@@ -177,7 +164,7 @@ static int Encode(aacpipe_t* p, aacpipe_out_fn out, void* ctx) {
         int64_t baseUs = p->baseUs;
         pthread_mutex_unlock(&p->lock);
 
-#if FAAC_V2
+#if FAAC_V3
         uint32_t written = 0;
         faac_status st = faac_encoder_encode(p->enc, block, AACPIPE_FRAME_SAMPLES, p->out, (uint32_t) p->maxOut,
                                              &written);

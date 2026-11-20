@@ -74,7 +74,7 @@ The output is `build/out/rhkd` and `build/out/hap-setupgen` (setup code generato
 | Variable | Default | |
 |---|---|---|
 | `TRANSCODE` | `1` | Include the Opus -> AAC fallback for recordings. `0` leaves out libopus and faac (~180 KB); recordings then need an AAC-LC 16 kHz rad output. |
-| `SYSTEM_AUDIO` | `0` | `1` links the system libopus and libfaac instead of building the bundled copies. faac 1.30 and faac >= 2 (the `faac_encoder_*` API) both work. |
+| `SYSTEM_AUDIO` | `0` | `1` links the system libopus and libfaac instead of building the bundled copies. faac 1.30 and faac >= 3.0 (the `faac_encoder_*` ABI 3) work; a faac 2.x header stops the build with an error. |
 | `AUDIO_CFLAGS` | | Include flags for the system headers, e.g. `-I$(SYSROOT)/usr/include/opus`. |
 
 **Match the SoC's floating-point ABI.** Thingino builds T31 (XBurst1) code FP32 with legacy NaN, and T41
