@@ -830,7 +830,15 @@ static void* Sender(void* arg HAP_UNUSED) {
         }
         if (!s.failed && !EmitFragments(&s, &fragSeq, &t0, &frames, &dropped, &ao))
             s.failed = true;
-        if (s.failed || NowMs() - streamStart > MAX_STREAM_MS) {
+        // A send that fails because the controller already closed this stream (dataSend/close arrived mid-send, then
+        // it shut the connection) isn't an error: the next round logs the normal "ended" summary.
+        bool closedByController = false;
+        if (s.failed) {
+            pthread_mutex_lock(&r.lock);
+            closedByController = r.conn != s.conn;
+            pthread_mutex_unlock(&r.lock);
+        }
+        if ((s.failed && !closedByController) || NowMs() - streamStart > MAX_STREAM_MS) {
             HAPLogInfo(&logObject, "recording stream %lld stopped (%s)", (long long) s.streamId,
                        s.failed ? "send failed" : "maximum length");
             recorder_stop(s.conn, !s.failed, s.failed ? 5 : 0);

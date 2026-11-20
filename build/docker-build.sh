@@ -33,9 +33,12 @@ ssh "$HOST" "cd $RDIR && if [ \"\$(cat .deps-stamp 2>/dev/null)\" != $STAMP ]; t
 fi"
 
 # 3. Compile in the container on the host tree (bind mount of a host path).
+# HomeKit's ADKVersion gets the commit (+"-dirty" with uncommitted changes under src/ or build/).
+REV=$(git rev-parse --short=7 HEAD 2>/dev/null || echo release)
+git diff --quiet HEAD -- src build 2>/dev/null || REV="$REV-dirty"
 RHOME=$(ssh "$HOST" 'echo $HOME')
 docker run --rm -u "$(ssh "$HOST" 'id -u'):$(ssh "$HOST" 'id -g')" -v "$RHOME/$RDIR:/work" -w /work/build "$IMAGE" \
-	sh -c "make -j\$(nproc) $CROSSARG OUT=$OUTDIR TRANSCODE=${TRANSCODE:-0} $* >&2"
+	sh -c "make -j\$(nproc) $CROSSARG OUT=$OUTDIR TRANSCODE=${TRANSCODE:-0} HAP_BUILD=$REV $* >&2"
 
 # 4. Fetch the binaries.
 mkdir -p build/$OUTDIR

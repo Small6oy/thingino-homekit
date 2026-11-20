@@ -74,6 +74,11 @@ RHKD_SRCS := $(filter-out %/aacpipe.c,$(RHKD_SRCS))
 endif
 # rhkd's objects depend on the audio settings (a file rewritten only when they change), so switching recompiles them.
 $(shell mkdir -p $(OUT); [ "$$(cat $(OUT)/.transcode 2>/dev/null)" = "$(TRANSCODE)$(SYSTEM_AUDIO)" ] || echo $(TRANSCODE)$(SYSTEM_AUDIO) > $(OUT)/.transcode)
+# ADKVersion (HomeKit's accessory info) reads "<HAP_VERSION>;<HAP_BUILD>": rhkd's version and the source commit
+# (docker-build.sh passes the git commit; package builds may pass HAP_BUILD, else "release"). ADK default: "Internal;<date>".
+RHKD_VER := $(shell sed -n 's/^\#define RHKD_VERSION "\(.*\)"/\1/p' $(SRC)/rhkd/version.h)
+HAP_BUILD ?= release
+$(shell [ "$$(cat $(OUT)/.hapver 2>/dev/null)" = "rhkd-$(RHKD_VER);$(HAP_BUILD)" ] || echo "rhkd-$(RHKD_VER);$(HAP_BUILD)" > $(OUT)/.hapver)
 
 obj = $(patsubst $(SRC)/%.c,$(OUT)/obj/%.o,$(1))
 
@@ -96,6 +101,9 @@ $(OUT)/libhap.a: $(call obj,$(filter-out %/HAPPlatformSystemInit.c,$(ADK_SRCS)))
 
 $(OUT)/hap-setupgen: $(call obj,$(GEN_SRCS) $(ADK)/PAL/HAPPlatformSystemInit.c) $(OUT)/libhap.a $(OUT)/libmbedcrypto.a
 	$(CC) -o $@ -Wl,--start-group $^ -Wl,--end-group $(LDFLAGS)
+
+$(call obj,$(ADK)/HAP/HAPVersion.c): CFLAGS += -DHAP_VERSION='"rhkd-$(RHKD_VER)"' -DHAP_BUILD='"$(HAP_BUILD)"'
+$(call obj,$(ADK)/HAP/HAPVersion.c): $(OUT)/.hapver
 
 # raptor-ipc wants GNU extensions; rhkd needs its headers.
 $(call obj,$(RIPC_SRCS)): CFLAGS += -D_GNU_SOURCE -I$(SRC)/raptor-ipc/include
