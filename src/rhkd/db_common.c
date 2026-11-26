@@ -10,6 +10,7 @@
 // Information Service, the Pairing service and finally the service signature exposed by the light bulb.
 
 #include "DB.h"
+#include "classes.h"
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -38,7 +39,8 @@
 #define kIID_PairingPairingPairings ((uint64_t) 0x0025)
 
 
-HAP_STATIC_ASSERT(kAttributeCount == 9 + 3 + 5 + 8 + 8 + 2 + 3 + 4 + 5 + 7 + 4 + 7, AttributeCount_mismatch); // service + its characteristics
+HAP_STATIC_ASSERT(kAttributeCount == 9 + 3 + 5 + 8 + 8 + 2 + 3 + 4 + 5 + 7 + 4 + 7 + RHKD_MAX_CLASS_SENSORS * 5,
+                  AttributeCount_mismatch); // service + its characteristics
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 

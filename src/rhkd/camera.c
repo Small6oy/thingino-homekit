@@ -1128,10 +1128,22 @@ static service_name_t gNames[] = {
     { kIID_MotionName, kIID_MotionConfiguredName, 0x06, "Motion" },
 };
 
+// One motion sensor per detected class (classes.h), built at start from raptor.conf [motion].
+// IIDs: 0x0400 + 0x10 * n for sensor n: +0 service, +1 MotionDetected, +2 StatusActive, +3 Name,
+// +4 Configured Name. A rename is kept under KVS key 0x20 + class id, so it follows the class.
+#define kIID_ClassBase ((uint64_t) 0x0400)
+#define kIID_ClassStep ((uint64_t) 0x0010)
+#define kAppKVSKey_ClassNameBase 0x20
+static classes_t gClasses;
+static service_name_t gClassNames[RHKD_MAX_CLASS_SENSORS];
+
 static service_name_t* NameFor(uint64_t iid) {
     for (size_t i = 0; i < HAPArrayCount(gNames); i++)
         if (gNames[i].nameIid == iid || gNames[i].configuredIid == iid)
             return &gNames[i];
+    for (int i = 0; i < gClasses.count; i++)
+        if (gClassNames[i].nameIid == iid || gClassNames[i].configuredIid == iid)
+            return &gClassNames[i];
     return NULL;
 }
 
@@ -1196,17 +1208,22 @@ static HAPError HandleServiceNameWrite(
     return kHAPError_None;
 }
 
-static void LoadServiceNames(void) {
-    for (size_t i = 0; i < HAPArrayCount(gNames); i++) {
-        char name[sizeof gNames[i].name];
-        size_t n = 0;
-        bool found = false;
-        if (!HAPPlatformKeyValueStoreGet(cam.keyValueStore, (HAPPlatformKeyValueStoreDomain) 0x00, gNames[i].key,
-                                         name, sizeof name - 1, &n, &found) && found && n > 0) {
-            name[n] = 0;
-            memcpy(gNames[i].name, name, n + 1);
-        }
+static void LoadName(service_name_t* e) {
+    char name[sizeof e->name];
+    size_t n = 0;
+    bool found = false;
+    if (!HAPPlatformKeyValueStoreGet(cam.keyValueStore, (HAPPlatformKeyValueStoreDomain) 0x00, e->key, name,
+                                     sizeof name - 1, &n, &found) && found && n > 0) {
+        name[n] = 0;
+        memcpy(e->name, name, n + 1);
     }
+}
+
+static void LoadServiceNames(void) {
+    for (size_t i = 0; i < HAPArrayCount(gNames); i++)
+        LoadName(&gNames[i]);
+    for (int i = 0; i < gClasses.count; i++)
+        LoadName(&gClassNames[i]);
 }
 
 static const HAPBoolCharacteristic echoOnCharacteristic = {
@@ -1320,6 +1337,31 @@ static const HAPStringCharacteristic motionConfiguredNameCharacteristic = {
     .callbacks = { .handleRead = HandleServiceNameRead, .handleWrite = HandleServiceNameWrite },
 };
 
+static HAPError HandleClassDetectedRead(
+        HAPAccessoryServerRef* server HAP_UNUSED,
+        const HAPBoolCharacteristicReadRequest* request,
+        bool* value,
+        void* _Nullable context HAP_UNUSED) {
+    *value = motion_class_detected((int) ((request->service->iid - kIID_ClassBase) / kIID_ClassStep));
+    return kHAPError_None;
+}
+
+static HAPError HandleClassStatusActiveRead(
+        HAPAccessoryServerRef* server HAP_UNUSED,
+        const HAPBoolCharacteristicReadRequest* request HAP_UNUSED,
+        bool* value,
+        void* _Nullable context HAP_UNUSED) {
+    *value = motion_class_available() && opmode_homekit_active();
+    return kHAPError_None;
+}
+
+static HAPBoolCharacteristic gClassDetected[RHKD_MAX_CLASS_SENSORS];
+static HAPBoolCharacteristic gClassActive[RHKD_MAX_CLASS_SENSORS];
+static HAPStringCharacteristic gClassName[RHKD_MAX_CLASS_SENSORS];
+static HAPStringCharacteristic gClassConfiguredName[RHKD_MAX_CLASS_SENSORS];
+static const HAPCharacteristic* gClassChars[RHKD_MAX_CLASS_SENSORS][5];
+static HAPService gClassService[RHKD_MAX_CLASS_SENSORS];
+
 static const HAPService motionService = {
     .iid = kIID_Motion,
     .serviceType = &kHAPServiceType_MotionSensor,
@@ -1346,6 +1388,38 @@ HAPError IdentifyAccessory(
     return kHAPError_None;
 }
 
+// The main sensor's characteristics, as the template for the class sensors.
+static void BuildClassSensors(void) {
+    for (int i = 0; i < gClasses.count; i++) {
+        uint64_t base = kIID_ClassBase + kIID_ClassStep * (uint64_t) i;
+        gClassDetected[i] = motionDetectedCharacteristic;
+        gClassDetected[i].iid = base + 1;
+        gClassDetected[i].callbacks.handleRead = HandleClassDetectedRead;
+        gClassActive[i] = motionStatusActiveCharacteristic;
+        gClassActive[i].iid = base + 2;
+        gClassActive[i].callbacks.handleRead = HandleClassStatusActiveRead;
+        gClassName[i] = motionNameCharacteristic;
+        gClassName[i].iid = base + 3;
+        gClassConfiguredName[i] = motionConfiguredNameCharacteristic;
+        gClassConfiguredName[i].iid = base + 4;
+        gClassChars[i][0] = &gClassDetected[i];
+        gClassChars[i][1] = &gClassActive[i];
+        gClassChars[i][2] = &gClassName[i];
+        gClassChars[i][3] = &gClassConfiguredName[i];
+        gClassChars[i][4] = NULL;
+        gClassService[i] = motionService;
+        gClassService[i].iid = base;
+        gClassService[i].characteristics = gClassChars[i];
+        service_name_t* e = &gClassNames[i];
+        e->nameIid = base + 3;
+        e->configuredIid = base + 4;
+        e->key = (HAPPlatformKeyValueStoreKey) (kAppKVSKey_ClassNameBase + gClasses.id[i]);
+        HAPRawBufferCopyBytes(e->name, gClasses.name[i], strlen(gClasses.name[i]) + 1);
+    }
+}
+
+static const HAPService* gServices[12 + RHKD_MAX_CLASS_SENSORS + 1];
+
 static HAPAccessory accessory = {
     .aid = 1,
     .category = kHAPAccessoryCategory_IPCameras,
@@ -1355,19 +1429,7 @@ static HAPAccessory accessory = {
     .serialNumber = "0000000001",
     .firmwareVersion = RHKD_VERSION,
     .hardwareVersion = "1",
-    .services = (const HAPService* const[]) { &accessoryInformationService,
-                                              &hapProtocolInformationService,
-                                              &pairingService,
-                                              &cameraService,
-                                              &cameraService2,
-                                              &microphoneService,
-                                              &speakerService,
-                                              &echoSwitchService,
-                                              &motionService,
-                                              &operatingModeService,
-                                              &dataStreamService,
-                                              &recordingService,
-                                              NULL },
+    .services = gServices, // BuildServices()
     .callbacks = { .identify = IdentifyAccessory },
 };
 
@@ -1388,6 +1450,21 @@ static void HandleSessionInvalidate(HAPAccessoryServerRef* server HAP_UNUSED, HA
         else if (!s->stream && s->haveSetup && session == s->setupSession)
             EndSession(s, "HAP session closed before start");
     }
+}
+
+static void BuildServices(void) {
+    static const HAPService* const fixed[] = { &accessoryInformationService, &hapProtocolInformationService,
+                                               &pairingService,              &cameraService,
+                                               &cameraService2,              &microphoneService,
+                                               &speakerService,              &echoSwitchService,
+                                               &motionService,               &operatingModeService,
+                                               &dataStreamService,           &recordingService };
+    size_t n = 0;
+    for (size_t i = 0; i < HAPArrayCount(fixed); i++)
+        gServices[n++] = fixed[i];
+    for (int i = 0; i < gClasses.count; i++)
+        gServices[n++] = &gClassService[i];
+    gServices[n] = NULL;
 }
 
 void AppCreate(HAPAccessoryServerRef* server, HAPPlatformKeyValueStoreRef keyValueStore) {
@@ -1426,8 +1503,9 @@ void AppRelease(void) {
 }
 
 // Bump this whenever services or characteristics change, so controllers re-read /accessories.
-#define kDBRevision ((uint32_t) 11) // 9: second RTP stream service, Echo Cancellation switch; 10: its Configured Name;
-                                     // 11: motion sensor Name + Configured Name
+#define kDBRevision ((uint32_t) 12) // 9: second RTP stream service, Echo Cancellation switch; 10: its Configured Name;
+                                     // 11: motion sensor Name + Configured Name; 12: class sensors
+// The class sensors come from raptor.conf, so their set is part of the revision: kDBRevision << 16 | fingerprint.
 #define kAppKVSDomain ((HAPPlatformKeyValueStoreDomain) 0x00)
 #define kAppKVSKey_DBRevision ((HAPPlatformKeyValueStoreKey) 0x01)
 
@@ -1440,12 +1518,14 @@ static void BumpConfigurationNumberIfDBChanged(void) {
     bool found = false;
     if (HAPPlatformKeyValueStoreGet(cam.keyValueStore, kAppKVSDomain, kAppKVSKey_DBRevision, bytes, sizeof bytes, &n, &found))
         return;
-    if (found && n == sizeof bytes && HAPReadLittleUInt32(bytes) == kDBRevision)
+    uint32_t revision = kDBRevision << 16 | classes_fingerprint(&gClasses);
+    if (found && n == sizeof bytes && HAPReadLittleUInt32(bytes) == revision)
         return;
-    HAPLogInfo(&logObject, "Accessory database revision %lu is new: incrementing configuration number.", (unsigned long) kDBRevision);
+    HAPLogInfo(&logObject, "Accessory database revision %lu.%04x is new: incrementing configuration number.",
+               (unsigned long) kDBRevision, (unsigned) (revision & 0xFFFF));
     if (HAPAccessoryServerIncrementCN(cam.keyValueStore))
         return;
-    HAPWriteLittleUInt32(bytes, kDBRevision);
+    HAPWriteLittleUInt32(bytes, revision);
     (void) HAPPlatformKeyValueStoreSet(cam.keyValueStore, kAppKVSDomain, kAppKVSKey_DBRevision, bytes, sizeof bytes);
 }
 
@@ -1461,6 +1541,16 @@ static void MotionChanged(bool motion, bool available) {
     (void) available;
 }
 
+// Runs on the HAP run loop (scheduled by the motion thread).
+static void ClassMotionChanged(int idx, bool motion HAP_UNUSED, bool available HAP_UNUSED) {
+    if (!cam.server || idx < 0 || idx >= gClasses.count)
+        return;
+    HAPAccessoryServerRaiseEvent(cam.server, (const HAPCharacteristic*) &gClassDetected[idx], &gClassService[idx],
+                                 AppGetAccessoryInfo());
+    HAPAccessoryServerRaiseEvent(cam.server, (const HAPCharacteristic*) &gClassActive[idx], &gClassService[idx],
+                                 AppGetAccessoryInfo());
+}
+
 // Runs on the HAP run loop when the camera is turned on or off in Home.
 static void OperatingModeChanged(bool homeKitActive) {
     if (!homeKitActive) {
@@ -1469,9 +1559,22 @@ static void OperatingModeChanged(bool homeKitActive) {
     }
     // StatusActive mirrors HomeKitCameraActive; StreamingStatus/SetupEndpoints reads change with it.
     MotionChanged(motion_detected(), motion_available());
+    for (int i = 0; i < gClasses.count; i++)
+        ClassMotionChanged(i, motion_class_detected(i), motion_class_available());
 }
 
 void AppAccessoryServerStart(void) {
+    const char* conf = getenv("RHKD_RAPTOR_CONF");
+    classes_load(&gClasses, conf && *conf ? conf : "/etc/raptor.conf");
+    BuildClassSensors();
+    BuildServices();
+    if (gClasses.count) {
+        char list[RHKD_MAX_CLASS_SENSORS * 34] = "";
+        for (int i = 0; i < gClasses.count; i++)
+            snprintf(list + strlen(list), sizeof list - strlen(list), "%s%s", i ? ", " : "", gClasses.name[i]);
+        HAPLogInfo(&logObject, "%d class sensor(s): %s; HKSV records on %s", gClasses.count, list,
+                   gClasses.recordAll ? "every class" : "record_classes");
+    }
     BumpConfigurationNumberIfDBChanged();
     LoadEchoCancel();
     LoadServiceNames();
@@ -1480,7 +1583,7 @@ void AppAccessoryServerStart(void) {
     hds_init(recording_hds_message, recording_hds_closed);
     bitrate_recover();
     HAPAccessoryServerStart(cam.server, &accessory);
-    if (motion_start(MotionChanged, 500))
+    if (motion_start(MotionChanged, ClassMotionChanged, &gClasses, 500))
         HAPLogError(&logObject, "could not start motion polling");
     HAPError err = HAPPlatformTimerRegister(&cam.watchdog, HAPPlatformClockGetCurrent() + 2000, Watchdog, NULL);
     HAPAssert(!err);

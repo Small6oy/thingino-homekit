@@ -24,6 +24,11 @@ on the camera.
   rad's `speaker` ring). An **Echo Cancellation** switch in Home turns rad's echo canceller on while talking.
 - **Snapshots** for the Home tile, from raptor's JPEG channel.
 - **Motion sensor,** fed by raptor's motion detection (IVS), with a debounce.
+- **One motion sensor per detection class** (Person, Pet, Package, Vehicle…) when raptor runs a YOLO model that
+  reports classes (`[motion] algorithm = yolo` with `class_names`, and rvd `ivs-status` returning `class_mask`).
+  Names come from `class_names` and can be renamed in Home. The main Motion sensor stays the one HKSV records on,
+  and counts only the classes in `[motion] record_classes` (unset: every class; `none`: never). Without such a
+  model nothing changes.
 - **Microphone mute.**
 - **HomeKit Secure Video:** recordings on motion, with a 4 s prebuffer, in the Home timeline (needs an
   iCloud+ plan and a home hub). Video is raptor's main H.264 stream as is, in fragmented MP4 over the HomeKit
