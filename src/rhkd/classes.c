@@ -11,6 +11,7 @@
 // The [motion] keys this needs; raptor.conf values are short.
 typedef struct {
     char algorithm[16];
+    char model[256];
     char classNames[256];
     char classes[256];
     char recordClasses[256];
@@ -54,6 +55,8 @@ static void ReadMotionKeys(const char* path, motion_keys_t* k) {
         size_t cap = 0;
         if (!strcmp(key, "algorithm"))
             dst = k->algorithm, cap = sizeof k->algorithm;
+        else if (!strcmp(key, "model"))
+            dst = k->model, cap = sizeof k->model;
         else if (!strcmp(key, "class_names"))
             dst = k->classNames, cap = sizeof k->classNames;
         else if (!strcmp(key, "classes"))
@@ -127,6 +130,26 @@ int classes_parse_list(const char* list, const char* names, uint16_t* mask, bool
     return bad;
 }
 
+// class_names from the model's own conf (thingino-ai model.conf), as rvd reads it: X.conf beside
+// [motion] model = X.bin, else X.bin.conf. raptor.conf's class_names, when set, wins.
+static void ModelClassNames(motion_keys_t* k) {
+    if (*k->classNames || !*k->model)
+        return;
+    char conf[sizeof k->model + 8];
+    size_t len = strlen(k->model);
+    motion_keys_t side;
+    side.classNames[0] = 0;
+    if (len > 4 && !strcmp(k->model + len - 4, ".bin")) {
+        snprintf(conf, sizeof conf, "%.*s.conf", (int) (len - 4), k->model);
+        ReadMotionKeys(conf, &side);
+    }
+    if (!*side.classNames) {
+        snprintf(conf, sizeof conf, "%s.conf", k->model);
+        ReadMotionKeys(conf, &side);
+    }
+    snprintf(k->classNames, sizeof k->classNames, "%s", side.classNames);
+}
+
 void classes_load(classes_t* c, const char* path) {
     memset(c, 0, sizeof *c);
     c->recordAll = true;
@@ -135,6 +158,7 @@ void classes_load(classes_t* c, const char* path) {
     c->yolo = !strcmp(k.algorithm, "yolo");
     if (!c->yolo)
         return;
+    ModelClassNames(&k);
 
     uint16_t detect;
     bool detectAll;

@@ -25,8 +25,9 @@ on the camera.
 - **Snapshots** for the Home tile, from raptor's JPEG channel.
 - **Motion sensor,** fed by raptor's motion detection (IVS), with a debounce.
 - **One motion sensor per detection class** (Person, Pet, Package, Vehicle…) when raptor runs a YOLO model that
-  reports classes (`[motion] algorithm = yolo` with `class_names`, and rvd `ivs-status` returning `class_mask`).
-  Names come from `class_names` and can be renamed in Home. The main Motion sensor stays the one HKSV records on,
+  reports classes (`[motion] algorithm = yolo`, and rvd `ivs-status` returning `class_mask`). Names come from
+  `[motion] class_names`, else from the model's own conf (`X.conf` beside `model = X.bin`, as rvd reads it), and can
+  be renamed in Home. The main Motion sensor stays the one HKSV records on,
   and counts only the classes in `[motion] record_classes` (unset: every class; `none`: never). Without such a
   model nothing changes.
 - **Microphone mute.**

@@ -19,7 +19,9 @@ typedef struct {
     bool recordAll;                        // unset (or nothing resolved): every class
 } classes_t;
 
-// Reads [motion] from path. Without yolo there are no class sensors and every motion records.
+// Reads [motion] from path; class_names unset there comes from the model's own conf (X.conf
+// beside model = X.bin, else X.bin.conf), as rvd does. Without yolo there are no class sensors
+// and every motion records.
 // Never fails: a missing file or section gives the plain-motion setup.
 void classes_load(classes_t* c, const char* path);
 
